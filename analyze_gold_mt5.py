@@ -19,6 +19,7 @@ from matplotlib.colors import to_rgba
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch, Rectangle
 from smartmoneyconcepts import smc
+from smc_backtest import run_smc_backtest
 
 
 # =========================================================
@@ -56,6 +57,18 @@ CSV_OUTPUT_FILE = "xauusd_m15_smc_results.csv"
 HTML_OUTPUT_FILE = "xauusd_m15_smc_chart.html"
 MPLFINANCE_OUTPUT_FILE = "xauusd_m15_smc_snapshot.png"
 MPLFINANCE_CANDLES = 300
+BACKTEST_OUTPUT_FILE = "xauusd_m15_smc_backtest.html"
+BACKTEST_TRADES_FILE = "xauusd_m15_smc_trades.csv"
+
+# Baseline backtest assumptions. These are intentionally visible in the
+# dashboard because historical results depend heavily on execution costs,
+# leverage, sizing, and exit rules.
+BACKTEST_CASH = 100_000
+BACKTEST_SPREAD = 0.0001
+BACKTEST_MARGIN = 0.05
+BACKTEST_POSITION_FRACTION = 0.10
+BACKTEST_RISK_REWARD = 2.0
+BACKTEST_ATR_MULTIPLIER = 1.5
 
 # Live dashboard settings. Set LIVE_MODE to False to create a
 # standalone HTML file once and exit as before.
@@ -683,8 +696,138 @@ def retracement_status(
     )
 
 
+def build_backtest_dashboard(
+    summary: dict | None,
+) -> str:
+    """Build backtest metrics, assumptions, and recent trades."""
+
+    if not summary:
+        return """
+<section class="backtest-dashboard" aria-labelledby="backtest-title">
+    <header class="reference-header">
+        <p class="eyebrow">Historical strategy simulation</p>
+        <h2 id="backtest-title">Backtest unavailable</h2>
+        <p>The backtest did not produce a result during this refresh.</p>
+    </header>
+</section>
+"""
+
+    def metric(
+        key: str,
+        *,
+        suffix: str = "",
+        decimals: int = 2,
+        money: bool = False,
+    ) -> str:
+        value = summary.get(key)
+
+        if value is None or pd.isna(value):
+            return "—"
+
+        if money:
+            return f"${float(value):,.2f}"
+
+        return f"{float(value):,.{decimals}f}{suffix}"
+
+    trade_rows = []
+
+    for trade in summary.get("recent_trades", []):
+        outcome_class = (
+            "trade-win"
+            if trade["outcome"] == "Win"
+            else "trade-loss"
+            if trade["outcome"] == "Loss"
+            else ""
+        )
+        trade_rows.append(
+            "<tr>"
+            f"<td>{trade['direction']}</td>"
+            f"<td>{trade['entry_time']}</td>"
+            f"<td>{trade['exit_time']}</td>"
+            f"<td>{trade['entry_price']:,.2f}</td>"
+            f"<td>{trade['exit_price']:,.2f}</td>"
+            f"<td class=\"{outcome_class}\">{trade['pnl']:,.2f}</td>"
+            f"<td class=\"{outcome_class}\">{trade['return_pct']:,.2f}%</td>"
+            "</tr>"
+        )
+
+    table_body = (
+        "".join(trade_rows)
+        if trade_rows
+        else "<tr><td colspan=\"7\">No completed trades for this rule set.</td></tr>"
+    )
+
+    leverage = (
+        1 / float(summary["margin"])
+        if float(summary.get("margin", 0)) > 0
+        else 1
+    )
+
+    return f"""
+<section class="backtest-dashboard" aria-labelledby="backtest-title">
+    <header class="dashboard-header">
+        <div>
+            <p class="eyebrow">Historical strategy simulation</p>
+            <h2 id="backtest-title">SMC pullback backtest</h2>
+            <p>{summary['start']} to {summary['end']} · Confirmed trend + structure bias + discount/premium pullback · ATR stop · {summary['risk_reward']:.1f}R target.</p>
+        </div>
+        <div class="backtest-links">
+            <a class="back-to-chart" href="{BACKTEST_OUTPUT_FILE}" target="_blank" rel="noopener">Interactive results</a>
+            <a class="back-to-chart" href="{BACKTEST_TRADES_FILE}" download>Trade CSV</a>
+        </div>
+    </header>
+
+    <div class="metric-grid backtest-metrics">
+        <article class="metric-card metric-primary">
+            <span>Strategy return</span>
+            <strong>{metric('return_pct', suffix='%')}</strong>
+            <small>Buy &amp; hold {metric('buy_hold_return_pct', suffix='%')}</small>
+        </article>
+        <article class="metric-card">
+            <span>Completed trades</span>
+            <strong>{summary['trades']}</strong>
+            <small>{summary['long_setups']} long · {summary['short_setups']} short setups</small>
+        </article>
+        <article class="metric-card">
+            <span>Win rate</span>
+            <strong>{metric('win_rate_pct', suffix='%')}</strong>
+            <small>Expectancy {metric('expectancy_pct', suffix='%')}</small>
+        </article>
+        <article class="metric-card">
+            <span>Maximum drawdown</span>
+            <strong>{metric('max_drawdown_pct', suffix='%')}</strong>
+            <small>Profit factor {metric('profit_factor')}</small>
+        </article>
+        <article class="metric-card">
+            <span>Final equity</span>
+            <strong>{metric('equity_final', money=True)}</strong>
+            <small>Starting cash ${summary['cash']:,.0f}</small>
+        </article>
+        <article class="metric-card metric-wide">
+            <span>Execution assumptions</span>
+            <strong>{summary['position_fraction'] * 100:.0f}% liquidity per trade · {leverage:.0f}:1 leverage</strong>
+            <small>{summary['spread'] * 10_000:.1f} bp spread · close-bar fills · {summary['atr_multiplier']:.1f} ATR minimum stop · pivots delayed {summary['swing_confirmation_bars']} candles</small>
+        </article>
+    </div>
+
+    <div class="trade-table-wrap">
+        <table class="trade-table">
+            <caption>Most recent completed trades</caption>
+            <thead>
+                <tr><th>Side</th><th>Entry</th><th>Exit</th><th>Entry price</th><th>Exit price</th><th>P&amp;L</th><th>Return</th></tr>
+            </thead>
+            <tbody>{table_body}</tbody>
+        </table>
+    </div>
+
+    <p class="analysis-disclaimer">Hypothetical historical simulation only—not a forecast or trading recommendation. Results omit slippage beyond the configured spread, financing, broker-specific contract sizing, news restrictions, and execution failures. Parameters were not optimized on this sample.</p>
+</section>
+"""
+
+
 def build_analysis_dashboard(
     data: pd.DataFrame,
+    backtest_summary: dict | None = None,
 ) -> str:
     """Build summary metrics and an indicator reference section."""
 
@@ -827,6 +970,10 @@ def build_analysis_dashboard(
         else "—"
     )
 
+    backtest_html = build_backtest_dashboard(
+        backtest_summary
+    )
+
     return f"""
 <section id="chart-summary" class="analysis-dashboard" aria-labelledby="summary-title">
     <header class="dashboard-header">
@@ -941,6 +1088,7 @@ def build_analysis_dashboard(
 
     <p class="analysis-disclaimer">Educational analysis only. SMC labels are algorithmic interpretations and should not be used as the sole basis for a trade.</p>
 </section>
+{backtest_html}
 """
 
 
@@ -2635,6 +2783,7 @@ def create_mplfinance_snapshot(
 def create_interactive_chart(
     results: pd.DataFrame,
     number_of_candles: int = 1200,
+    backtest_summary: dict | None = None,
 ) -> Path:
     """Create a clean interactive SMC chart."""
 
@@ -3177,13 +3326,37 @@ def create_interactive_chart(
         },
     )
 
+    latest_window_start = max(
+        first_time,
+        last_time - pd.Timedelta(days=3),
+    )
+
+    chart_range_end = (
+        last_time
+        + pd.Timedelta(
+            minutes=TIMEFRAME_MINUTES * 3
+        )
+    )
+
+    default_price_data = chart_data[
+        chart_data["time"] >= latest_window_start
+    ]
+    default_price_low = float(
+        default_price_data["low"].min()
+    )
+    default_price_high = float(
+        default_price_data["high"].max()
+    )
+    default_price_span = max(
+        default_price_high - default_price_low,
+        default_price_high * 0.002,
+    )
+    default_price_padding = default_price_span * 0.08
+
     fig.update_xaxes(
         range=[
-            first_time,
-            last_time
-            + pd.Timedelta(
-                minutes=TIMEFRAME_MINUTES * 3
-            ),
+            latest_window_start,
+            chart_range_end,
         ],
         rangebreaks=[
             {
@@ -3204,6 +3377,11 @@ def create_interactive_chart(
     )
 
     fig.update_yaxes(
+        range=[
+            default_price_low - default_price_padding,
+            default_price_high + default_price_padding,
+        ],
+        autorange=False,
         gridcolor="#29313a",
         tickformat=".2f",
         fixedrange=False,
@@ -3240,18 +3418,6 @@ def create_interactive_chart(
         },
     }
 
-    latest_window_start = max(
-        first_time,
-        last_time - pd.Timedelta(days=3),
-    )
-
-    chart_range_end = (
-        last_time
-        + pd.Timedelta(
-            minutes=TIMEFRAME_MINUTES * 3
-        )
-    )
-
     responsive_script = """
 (() => {
     const plot = document.getElementById("smc-chart");
@@ -3268,6 +3434,7 @@ def create_interactive_chart(
     const yAutoButton = document.getElementById("chart-y-auto");
     const exportButton = document.getElementById("chart-export");
     const mplfinanceButton = document.getElementById("chart-mplfinance");
+    const backtestButton = document.getElementById("chart-backtest");
     const summaryButton = document.getElementById("chart-summary-button");
     const fullscreenButton = document.getElementById("chart-fullscreen");
     const helpButton = document.getElementById("chart-help-button");
@@ -3368,9 +3535,68 @@ def create_interactive_chart(
             lastTimestamp.getTime() - days * 86400000
         );
 
+        setChartWindow([start.toISOString(), fullRange[1]]);
+    }
+
+    function candlePriceRange(xRange) {
+        const candles = plot.data.find(
+            (trace) => trace.type === "candlestick"
+        );
+
+        if (!candles || !candles.x?.length) return null;
+
+        const start = new Date(xRange[0]).getTime();
+        const end = new Date(xRange[1]).getTime();
+        const lows = [];
+        const highs = [];
+
+        candles.x.forEach((value, index) => {
+            const timestamp = new Date(value).getTime();
+
+            if (timestamp < start || timestamp > end) return;
+
+            const low = Number(candles.low[index]);
+            const high = Number(candles.high[index]);
+
+            if (Number.isFinite(low) && Number.isFinite(high)) {
+                lows.push(low);
+                highs.push(high);
+            }
+        });
+
+        if (!lows.length) return null;
+
+        const low = Math.min(...lows);
+        const high = Math.max(...highs);
+        const span = Math.max(high - low, high * 0.002);
+        const padding = span * 0.08;
+
+        return [low - padding, high + padding];
+    }
+
+    function setChartWindow(xRange) {
+        const priceRange = candlePriceRange(xRange);
+        const updates = {
+            "xaxis.range": xRange
+        };
+
+        if (priceRange) {
+            updates["yaxis.autorange"] = false;
+            updates["yaxis.range"] = priceRange;
+        }
+
+        Plotly.relayout(plot, updates);
+    }
+
+    function fitVisibleCandles() {
+        const xRange = plot?._fullLayout?.xaxis?.range || fullRange;
+        const priceRange = candlePriceRange(xRange);
+
+        if (!priceRange) return;
+
         Plotly.relayout(plot, {
-            "xaxis.range": [start.toISOString(), fullRange[1]],
-            "yaxis.autorange": true
+            "yaxis.autorange": false,
+            "yaxis.range": priceRange
         });
     }
 
@@ -3557,10 +3783,7 @@ def create_interactive_chart(
     });
 
     latestButton?.addEventListener("click", () => {
-        Plotly.relayout(plot, {
-            "xaxis.range": latestRange,
-            "yaxis.autorange": true
-        });
+        setChartWindow(latestRange);
     });
 
     oneWeekButton?.addEventListener("click", () => {
@@ -3568,10 +3791,7 @@ def create_interactive_chart(
     });
 
     fitButton?.addEventListener("click", () => {
-        Plotly.relayout(plot, {
-            "xaxis.range": fullRange,
-            "yaxis.autorange": true
-        });
+        setChartWindow(fullRange);
     });
 
     yZoomInButton?.addEventListener("click", () => {
@@ -3583,9 +3803,7 @@ def create_interactive_chart(
     });
 
     yAutoButton?.addEventListener("click", () => {
-        Plotly.relayout(plot, {
-            "yaxis.autorange": true
-        });
+        fitVisibleCandles();
     });
 
     layerToggles.forEach((toggle) => {
@@ -3647,6 +3865,13 @@ def create_interactive_chart(
         window.open(target, "_blank", "noopener");
     });
 
+    backtestButton?.addEventListener("click", () => {
+        const target = location.protocol === "file:"
+            ? "xauusd_m15_smc_backtest.html"
+            : "/backtest";
+        window.open(target, "_blank", "noopener");
+    });
+
     summaryButton?.addEventListener("click", () => {
         document.getElementById("chart-summary")?.scrollIntoView({
             behavior: "smooth",
@@ -3690,6 +3915,7 @@ def create_interactive_chart(
         if (event.key.toLowerCase() === "i") indicatorButton?.click();
         if (event.key.toLowerCase() === "e") exportButton?.click();
         if (event.key.toLowerCase() === "p") mplfinanceButton?.click();
+        if (event.key.toLowerCase() === "b") backtestButton?.click();
         if (event.key.toLowerCase() === "s") summaryButton?.click();
         if (event.key.toLowerCase() === "h") helpButton?.click();
         if (event.key === "1") oneDayButton?.click();
@@ -3708,6 +3934,7 @@ def create_interactive_chart(
     }
 
     applyResponsiveLayout();
+    setLabelsVisibility(labelsToggle?.checked ?? false);
     restoreChartView();
     pollLiveStatus();
     window.setInterval(
@@ -4104,6 +4331,69 @@ def create_interactive_chart(
             #0d1013;
     }
 
+    .backtest-dashboard {
+        width: min(1440px, 100%);
+        margin: 0 auto;
+        padding: 0 clamp(16px, 4vw, 56px) 64px;
+        color: #e8eef4;
+        background: #0d1013;
+    }
+
+    .backtest-links {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+
+    .backtest-metrics {
+        margin-bottom: 22px;
+    }
+
+    .trade-table-wrap {
+        width: 100%;
+        overflow-x: auto;
+        border: 1px solid #27313a;
+        border-radius: 10px;
+        background: #11161a;
+    }
+
+    .trade-table {
+        width: 100%;
+        min-width: 820px;
+        border-collapse: collapse;
+        font-size: 11px;
+    }
+
+    .trade-table caption {
+        padding: 14px 16px;
+        color: #dce6ee;
+        font-size: 13px;
+        font-weight: 700;
+        text-align: left;
+    }
+
+    .trade-table th,
+    .trade-table td {
+        padding: 10px 12px;
+        border-top: 1px solid #26313a;
+        color: #aab7c2;
+        text-align: left;
+        white-space: nowrap;
+    }
+
+    .trade-table th {
+        color: #dce6ee;
+        background: #171d22;
+    }
+
+    .trade-table .trade-win {
+        color: #65e9cb;
+    }
+
+    .trade-table .trade-loss {
+        color: #ff8c97;
+    }
+
     .dashboard-header,
     .reference-header {
         display: flex;
@@ -4311,6 +4601,10 @@ def create_interactive_chart(
             padding-top: 30px;
         }
 
+        .backtest-dashboard {
+            padding-bottom: 40px;
+        }
+
         .indicator-panel {
             top: 148px;
             left: 8px;
@@ -4356,6 +4650,7 @@ def create_interactive_chart(
             <button id="chart-summary-button" type="button" title="Open summary and indicator guide (S)">Summary</button>
             <button id="chart-export" type="button" title="Export a PNG image (E)">Export</button>
             <button id="chart-mplfinance" type="button" title="Open the clean mplfinance chart (P)">MPL View</button>
+            <button id="chart-backtest" type="button" title="Open interactive strategy backtest (B)">Backtest</button>
             <button id="chart-fullscreen" type="button" title="Toggle fullscreen (F)" aria-pressed="false">Fullscreen</button>
             <button id="chart-help-button" type="button" title="Chart help and shortcuts (H)">Help</button>
         </span>
@@ -4429,7 +4724,7 @@ def create_interactive_chart(
             <legend>Display</legend>
             <label class="display-option">
                 <span>Indicator labels</span>
-                <input id="toggle-labels" type="checkbox" checked>
+                <input id="toggle-labels" type="checkbox">
             </label>
             <label class="display-option">
                 <span>Grid lines</span>
@@ -4461,7 +4756,7 @@ def create_interactive_chart(
                 <li>Drag directly on an axis for manual scaling.</li>
             </ul>
             <h3>Keyboard shortcuts</h3>
-            <p>1/3/7: time range · R: all · +/-: vertical zoom · 0: Y Auto · I: indicators · S: summary · E: export · P: mplfinance view · F: fullscreen · H: help</p>
+            <p>1/3/7: time range · R: all · +/-: vertical zoom · 0: Y Auto · I: indicators · S: summary · E: export · P: mplfinance view · B: backtest · F: fullscreen · H: help</p>
             <h3>Indicator abbreviations</h3>
             <p>FVG: Fair Value Gap · OB: Order Block · BSL/SSL: buy-side/sell-side liquidity · HH/HL/LH/LL: swing sequence · EQ: dealing-range midpoint · PH/PL: previous high/low · C/D: current/deepest retracement.</p>
             <div class="help-footer">
@@ -4477,7 +4772,8 @@ def create_interactive_chart(
     )
 
     dashboard_html = build_analysis_dashboard(
-        data
+        data,
+        backtest_summary=backtest_summary,
     )
 
     html = html.replace(
@@ -4611,9 +4907,31 @@ def analyze_and_write_outputs(
             missing_ok=True
         )
 
+    backtest_summary = None
+
+    try:
+        backtest_summary = run_smc_backtest(
+            results,
+            output_file=BACKTEST_OUTPUT_FILE,
+            trades_file=BACKTEST_TRADES_FILE,
+            swing_confirmation_bars=SWING_LENGTH,
+            cash=BACKTEST_CASH,
+            spread=BACKTEST_SPREAD,
+            margin=BACKTEST_MARGIN,
+            position_fraction=BACKTEST_POSITION_FRACTION,
+            risk_reward=BACKTEST_RISK_REWARD,
+            atr_multiplier=BACKTEST_ATR_MULTIPLIER,
+        )
+    except Exception as backtest_error:
+        print(
+            "Backtest warning: "
+            f"{backtest_error}"
+        )
+
     chart_path = create_interactive_chart(
         results=results,
         number_of_candles=CHART_CANDLES,
+        backtest_summary=backtest_summary,
     )
 
     create_mplfinance_snapshot(
@@ -4791,6 +5109,52 @@ class LiveDashboardRequestHandler(
                 200,
                 "image/png",
                 snapshot_path.read_bytes(),
+            )
+            return
+
+        if request_path in {
+            "/backtest",
+            f"/{BACKTEST_OUTPUT_FILE}",
+        }:
+            backtest_path = Path(
+                BACKTEST_OUTPUT_FILE
+            ).resolve()
+
+            if not backtest_path.exists():
+                self.send_bytes(
+                    503,
+                    "text/plain; charset=utf-8",
+                    b"The backtest is still being generated.",
+                )
+                return
+
+            self.send_bytes(
+                200,
+                "text/html; charset=utf-8",
+                backtest_path.read_bytes(),
+            )
+            return
+
+        if request_path in {
+            "/backtest-trades.csv",
+            f"/{BACKTEST_TRADES_FILE}",
+        }:
+            trades_path = Path(
+                BACKTEST_TRADES_FILE
+            ).resolve()
+
+            if not trades_path.exists():
+                self.send_bytes(
+                    503,
+                    "text/plain; charset=utf-8",
+                    b"The backtest trade list is still being generated.",
+                )
+                return
+
+            self.send_bytes(
+                200,
+                "text/csv; charset=utf-8",
+                trades_path.read_bytes(),
             )
             return
 
@@ -5002,6 +5366,14 @@ def main() -> None:
         print(
             "MPL chart:  "
             f"{Path(MPLFINANCE_OUTPUT_FILE).resolve()}"
+        )
+        print(
+            "Backtest:   "
+            f"{Path(BACKTEST_OUTPUT_FILE).resolve()}"
+        )
+        print(
+            "Trades:     "
+            f"{Path(BACKTEST_TRADES_FILE).resolve()}"
         )
 
         last_candle_time = pd.Timestamp(

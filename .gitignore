@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 xauusd_m15_smc_results.csv
 xauusd_m15_smc_chart.html
+xauusd_m15_smc_backtest.html
+xauusd_m15_smc_trades.csv
