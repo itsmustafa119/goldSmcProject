@@ -1,4 +1,5 @@
 MetaTrader5
+mplfinance
 pandas
 plotly
 smartmoneyconcepts

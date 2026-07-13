@@ -1,9 +1,23 @@
 from pathlib import Path
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
+import json
+import threading
+import time
 import webbrowser
 
 import MetaTrader5 as mt5
+import matplotlib
+
+matplotlib.use("Agg")
+
 import pandas as pd
 import plotly.graph_objects as go
+import mplfinance as mpf
+from matplotlib import pyplot as plt
+from matplotlib.colors import to_rgba
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch, Rectangle
 from smartmoneyconcepts import smc
 
 
@@ -33,13 +47,31 @@ SESSION_COLORS = {
 }
 
 # Limit visible active zones to keep the chart clean.
-MAX_FVG_ZONES = 8
-MAX_OB_ZONES = 6
+MAX_FVG_ZONES = 16
+MAX_OB_ZONES = 10
 MAX_LIQUIDITY_LEVELS = 6
 MAX_SWING_MARKERS = 40
 
 CSV_OUTPUT_FILE = "xauusd_m15_smc_results.csv"
 HTML_OUTPUT_FILE = "xauusd_m15_smc_chart.html"
+MPLFINANCE_OUTPUT_FILE = "xauusd_m15_smc_snapshot.png"
+MPLFINANCE_CANDLES = 300
+
+# Live dashboard settings. Set LIVE_MODE to False to create a
+# standalone HTML file once and exit as before.
+LIVE_MODE = True
+LIVE_REFRESH_SECONDS = 5
+LIVE_HOST = "127.0.0.1"
+LIVE_PORT = 8765
+
+LIVE_STATE = {
+    "version": 0,
+    "last_candle_time": None,
+    "last_price": None,
+    "updated_at": None,
+    "error": None,
+}
+LIVE_STATE_LOCK = threading.Lock()
 
 
 # =========================================================
@@ -194,6 +226,11 @@ def calculate_smc_indicators(
         time_frame="1D",
     ).reset_index(drop=True)
 
+    four_hour_levels = smc.previous_high_low(
+        indexed_data,
+        time_frame="4h",
+    ).reset_index(drop=True)
+
     retracements = smc.retracements(
         data,
         swings,
@@ -243,6 +280,9 @@ def calculate_smc_indicators(
             previous_levels
             .add_prefix("Daily_"),
 
+            four_hour_levels
+            .add_prefix("FourHour_"),
+
             retracements
             .reset_index(drop=True)
             .add_prefix("Retracement_"),
@@ -252,7 +292,108 @@ def calculate_smc_indicators(
         axis=1,
     )
 
+    validate_indicator_results(
+        results
+    )
+
     return results
+
+
+def validate_indicator_results(
+    results: pd.DataFrame,
+) -> None:
+    """Fail clearly if the upstream SMC API shape changes."""
+
+    expected_columns = {
+        "Swing_HighLow",
+        "Swing_Level",
+        "FVG_FVG",
+        "FVG_Top",
+        "FVG_Bottom",
+        "FVG_MitigatedIndex",
+        "Structure_BOS",
+        "Structure_CHOCH",
+        "Structure_Level",
+        "Structure_BrokenIndex",
+        "Liquidity_Liquidity",
+        "Liquidity_Level",
+        "Liquidity_End",
+        "Liquidity_Swept",
+        "OB_OB",
+        "OB_Top",
+        "OB_Bottom",
+        "OB_OBVolume",
+        "OB_MitigatedIndex",
+        "OB_Percentage",
+        "Daily_PreviousHigh",
+        "Daily_PreviousLow",
+        "Daily_BrokenHigh",
+        "Daily_BrokenLow",
+        "FourHour_PreviousHigh",
+        "FourHour_PreviousLow",
+        "FourHour_BrokenHigh",
+        "FourHour_BrokenLow",
+        "Retracement_Direction",
+        "Retracement_CurrentRetracement%",
+        "Retracement_DeepestRetracement%",
+        "Session_London_Active",
+        "Session_London_High",
+        "Session_London_Low",
+        "Session_NewYork_Active",
+        "Session_NewYork_High",
+        "Session_NewYork_Low",
+    }
+
+    missing_columns = sorted(
+        expected_columns - set(results.columns)
+    )
+
+    if missing_columns:
+        raise ValueError(
+            "The smartmoneyconcepts output schema changed. "
+            f"Missing columns: {missing_columns}"
+        )
+
+    direction_columns = [
+        "Swing_HighLow",
+        "FVG_FVG",
+        "Structure_BOS",
+        "Structure_CHOCH",
+        "Liquidity_Liquidity",
+        "OB_OB",
+        "Retracement_Direction",
+    ]
+
+    for column in direction_columns:
+        unexpected = set(
+            results[column]
+            .dropna()
+            .astype(float)
+            .unique()
+        ) - {-1.0, 0.0, 1.0}
+
+        if unexpected:
+            raise ValueError(
+                f"Unexpected values in {column}: "
+                f"{sorted(unexpected)}"
+            )
+
+    for session_column in [
+        "Session_London_Active",
+        "Session_NewYork_Active",
+    ]:
+        unexpected = set(
+            results[session_column]
+            .dropna()
+            .astype(int)
+            .unique()
+        ) - {0, 1}
+
+        if unexpected:
+            raise ValueError(
+                f"Unexpected values in {session_column}: "
+                f"{sorted(unexpected)}"
+            )
 
 
 # =========================================================
@@ -358,6 +499,218 @@ def retracement_status(
     )
 
 
+def build_analysis_dashboard(
+    data: pd.DataFrame,
+) -> str:
+    """Build summary metrics and an indicator reference section."""
+
+    latest = data.iloc[-1]
+
+    def price_value(column: str) -> str:
+        value = latest_value(data, column)
+
+        if value is None or pd.isna(value):
+            return "—"
+
+        return f"{float(value):,.2f}"
+
+    def active_count(
+        signal_column: str,
+        completion_column: str,
+    ) -> int:
+        if signal_column not in data.columns:
+            return 0
+
+        signals = data[
+            data[signal_column].fillna(0).ne(0)
+        ]
+
+        if completion_column not in signals.columns:
+            return len(signals)
+
+        return int(
+            signals[completion_column]
+            .apply(indicator_is_active)
+            .sum()
+        )
+
+    latest_structure = "No confirmed structure break"
+
+    if {
+        "Structure_BOS",
+        "Structure_CHOCH",
+        "Structure_BrokenIndex",
+    }.issubset(data.columns):
+        structure_rows = data[
+            (
+                data["Structure_BOS"].fillna(0).ne(0)
+                | data["Structure_CHOCH"].fillna(0).ne(0)
+            )
+            & data["Structure_BrokenIndex"].notna()
+        ].copy()
+
+        if not structure_rows.empty:
+            structure_rows["_break"] = pd.to_numeric(
+                structure_rows["Structure_BrokenIndex"],
+                errors="coerce",
+            )
+
+            structure_row = structure_rows.sort_values(
+                "_break"
+            ).iloc[-1]
+
+            if pd.notna(structure_row["Structure_BOS"]):
+                structure_name = "BOS"
+                direction_value = structure_row["Structure_BOS"]
+            else:
+                structure_name = "CHoCH"
+                direction_value = structure_row["Structure_CHOCH"]
+
+            direction_name = (
+                "Bullish"
+                if direction_value == 1
+                else "Bearish"
+            )
+
+            break_time = get_index_time(
+                data,
+                structure_row["Structure_BrokenIndex"],
+                structure_row["time"],
+            )
+
+            latest_structure = (
+                f"{direction_name} {structure_name} · "
+                f"{float(structure_row['Structure_Level']):,.2f} · "
+                f"{break_time}"
+            )
+
+    active_sessions = []
+
+    for session_name in SESSION_COLORS:
+        session_prefix = session_name.replace(" ", "")
+        column = f"Session_{session_prefix}_Active"
+
+        if column in data.columns and latest[column] == 1:
+            active_sessions.append(session_name)
+
+    session_text = (
+        ", ".join(active_sessions)
+        if active_sessions
+        else "No tracked session active"
+    )
+
+    fvg_count = active_count(
+        "FVG_FVG",
+        "FVG_MitigatedIndex",
+    )
+    ob_count = active_count(
+        "OB_OB",
+        "OB_MitigatedIndex",
+    )
+    liquidity_count = active_count(
+        "Liquidity_Liquidity",
+        "Liquidity_Swept",
+    )
+
+    retracement_text = retracement_status(data)
+
+    return f"""
+<section id="chart-summary" class="analysis-dashboard" aria-labelledby="summary-title">
+    <header class="dashboard-header">
+        <div>
+            <p class="eyebrow">XAUUSD {TIMEFRAME_NAME} analysis</p>
+            <h2 id="summary-title">Market summary</h2>
+            <p>Latest completed candle: {latest['time']} · Indicators use completed candles to avoid intrabar repainting.</p>
+        </div>
+        <a class="back-to-chart" href="#chart-shell">Back to chart</a>
+    </header>
+
+    <div class="metric-grid">
+        <article class="metric-card metric-primary">
+            <span>Live / latest price</span>
+            <strong id="live-current-price">{float(latest['close']):,.2f}</strong>
+            <small>O {float(latest['open']):,.2f} · H {float(latest['high']):,.2f} · L {float(latest['low']):,.2f} · C {float(latest['close']):,.2f}</small>
+        </article>
+        <article class="metric-card">
+            <span>Previous day</span>
+            <strong>H {price_value('Daily_PreviousHigh')}</strong>
+            <small>L {price_value('Daily_PreviousLow')}</small>
+        </article>
+        <article class="metric-card">
+            <span>Previous 4H</span>
+            <strong>H {price_value('FourHour_PreviousHigh')}</strong>
+            <small>L {price_value('FourHour_PreviousLow')}</small>
+        </article>
+        <article class="metric-card">
+            <span>Active zones</span>
+            <strong>{fvg_count} FVG · {ob_count} OB</strong>
+            <small>{liquidity_count} unswept liquidity pools</small>
+        </article>
+        <article class="metric-card metric-wide">
+            <span>Latest confirmed structure</span>
+            <strong>{latest_structure}</strong>
+        </article>
+        <article class="metric-card metric-wide">
+            <span>Retracement / session</span>
+            <strong>{retracement_text}</strong>
+            <small>{session_text}</small>
+        </article>
+    </div>
+
+    <header class="reference-header">
+        <p class="eyebrow">Indicator reference</p>
+        <h2>Definitions and practical use</h2>
+        <p>These describe what the library calculates. They are context tools, not standalone trade signals.</p>
+    </header>
+
+    <div class="definition-grid">
+        <article class="definition-card fvg-definition">
+            <h3>Fair Value Gap <span>FVG</span></h3>
+            <p><strong>Definition:</strong> A three-candle imbalance where price leaves a gap between candle one and candle three.</p>
+            <p><strong>Use:</strong> Watch for price revisiting the zone, reacting from it, or fully mitigating it. Separate rectangles represent separate gaps.</p>
+        </article>
+        <article class="definition-card ob-definition">
+            <h3>Order Block <span>OB</span></h3>
+            <p><strong>Definition:</strong> The source price range preceding displacement through a swing level.</p>
+            <p><strong>Use:</strong> Treat it as a potential reaction area. Volume and percentage describe the library's relative OB activity, not win probability.</p>
+        </article>
+        <article class="definition-card liquidity-definition">
+            <h3>Liquidity</h3>
+            <p><strong>Definition:</strong> Multiple swing highs or lows grouped within the configured price tolerance.</p>
+            <p><strong>Use:</strong> These areas may contain clustered stops. A sweep shows price trading through the pool; confirmation is still required.</p>
+        </article>
+        <article class="definition-card structure-definition">
+            <h3>BOS and CHoCH</h3>
+            <p><strong>BOS:</strong> A confirmed structural break commonly interpreted as continuation.</p>
+            <p><strong>CHoCH:</strong> A confirmed change in swing sequence that can warn of a possible regime shift or reversal.</p>
+        </article>
+        <article class="definition-card swing-definition">
+            <h3>Swing Highs and Lows</h3>
+            <p><strong>Definition:</strong> Confirmed pivots that are highest or lowest across the configured candles before and after.</p>
+            <p><strong>Use:</strong> They anchor structure, liquidity, order blocks, and retracement calculations. They confirm only after future candles exist.</p>
+        </article>
+        <article class="definition-card levels-definition">
+            <h3>Previous Highs and Lows</h3>
+            <p><strong>Definition:</strong> High and low of the preceding 4H or daily period, with broken-state tracking.</p>
+            <p><strong>Use:</strong> Common reference levels for targets, liquidity, support/resistance, and intraday bias.</p>
+        </article>
+        <article class="definition-card sessions-definition">
+            <h3>Trading Sessions</h3>
+            <p><strong>Definition:</strong> Session membership plus the developing session high and low in UTC.</p>
+            <p><strong>Use:</strong> Compare volatility, range expansion, and reactions during London and New York hours.</p>
+        </article>
+        <article class="definition-card retracement-definition">
+            <h3>Retracements</h3>
+            <p><strong>Definition:</strong> Current and deepest percentage retracement between confirmed swing extremes.</p>
+            <p><strong>Use:</strong> Measure pullback depth and compare it with structure. Values can exceed 100% after extension beyond the reference swing.</p>
+        </article>
+    </div>
+
+    <p class="analysis-disclaimer">Educational analysis only. SMC labels are algorithmic interpretations and should not be used as the sole basis for a trade.</p>
+</section>
+"""
+
+
 def add_session_regions(
     fig: go.Figure,
     data: pd.DataFrame,
@@ -368,8 +721,16 @@ def add_session_regions(
 
     session_prefix = session_name.replace(" ", "")
     active_column = f"Session_{session_prefix}_Active"
+    high_column = f"Session_{session_prefix}_High"
+    low_column = f"Session_{session_prefix}_Low"
 
-    if active_column not in data.columns:
+    required_columns = {
+        active_column,
+        high_column,
+        low_column,
+    }
+
+    if not required_columns.issubset(data.columns):
         return
 
     active = data[active_column].fillna(0).eq(1)
@@ -392,14 +753,30 @@ def add_session_regions(
             + pd.Timedelta(minutes=TIMEFRAME_MINUTES)
         )
 
+        session_high = float(
+            session_rows[high_column].max()
+        )
+
+        positive_lows = session_rows.loc[
+            session_rows[low_column] > 0,
+            low_column,
+        ]
+
+        if positive_lows.empty:
+            continue
+
+        session_low = float(
+            positive_lows.min()
+        )
+
         fig.add_shape(
             type="rect",
             xref="x",
-            yref="paper",
+            yref="y",
             x0=start_time,
             x1=end_time,
-            y0=0,
-            y1=1,
+            y0=session_low,
+            y1=session_high,
             fillcolor=fill_color,
             line={"width": 0},
             layer="below",
@@ -429,6 +806,38 @@ def add_swing_markers(
         data["Swing_HighLow"].fillna(0).ne(0)
         & data["Swing_Level"].notna()
     ].tail(MAX_SWING_MARKERS)
+
+    swing_rows = list(
+        swings.iterrows()
+    )
+
+    for position in range(
+        len(swing_rows) - 1
+    ):
+        _, start = swing_rows[position]
+        _, end = swing_rows[position + 1]
+
+        line_color = (
+            "rgba(45, 220, 120, 0.48)"
+            if start["Swing_HighLow"] == -1
+            else "rgba(255, 80, 95, 0.48)"
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=[start["time"], end["time"]],
+                y=[start["Swing_Level"], end["Swing_Level"]],
+                mode="lines",
+                line={
+                    "color": line_color,
+                    "width": 1.6,
+                },
+                name="Swing Structure",
+                legendgroup="swings",
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
 
     definitions = [
         (1, "Swing High", "#69d7ff", "triangle-down-open"),
@@ -465,16 +874,17 @@ def add_swing_markers(
         )
 
 
-def select_nearest_active_zones(
+def select_chart_zones(
     data: pd.DataFrame,
     signal_column: str,
     top_column: str,
     bottom_column: str,
     mitigation_column: str,
     current_price: float,
+    first_time,
     maximum_zones: int,
 ) -> pd.DataFrame:
-    """Select active zones closest to current price."""
+    """Select nearby active zones plus recently mitigated zones."""
 
     required_columns = {
         signal_column,
@@ -494,16 +904,6 @@ def select_nearest_active_zones(
     if zones.empty:
         return zones
 
-    if mitigation_column in zones.columns:
-        zones = zones[
-            zones[mitigation_column].apply(
-                indicator_is_active
-            )
-        ].copy()
-
-    if zones.empty:
-        return zones
-
     zones["_middle"] = (
         zones[top_column].astype(float)
         + zones[bottom_column].astype(float)
@@ -513,9 +913,66 @@ def select_nearest_active_zones(
         zones["_middle"] - current_price
     ).abs()
 
+    if mitigation_column in zones.columns:
+        mitigation = pd.to_numeric(
+            zones[mitigation_column],
+            errors="coerce",
+        ).fillna(0)
+    else:
+        mitigation = pd.Series(
+            0,
+            index=zones.index,
+        )
+
+    zones["_active"] = mitigation.le(0)
+    zones["_end_index"] = mitigation.where(
+        mitigation.gt(0),
+        len(data) - 1,
+    ).clip(
+        lower=0,
+        upper=len(data) - 1,
+    ).astype(int)
+
+    zones["_end_time"] = zones[
+        "_end_index"
+    ].map(
+        data["time"].reset_index(drop=True)
+    )
+
+    zones = zones[
+        zones["_end_time"] >= first_time
+    ].copy()
+
+    if zones.empty:
+        return zones
+
+    active_limit = max(
+        1,
+        maximum_zones // 2,
+    )
+
+    active = zones[
+        zones["_active"]
+    ].nsmallest(
+        active_limit,
+        "_distance",
+    )
+
+    completed_limit = max(
+        0,
+        maximum_zones - len(active),
+    )
+
+    completed = zones[
+        ~zones["_active"]
+    ].nlargest(
+        completed_limit,
+        "_end_index",
+    )
+
     return (
-        zones
-        .nsmallest(maximum_zones, "_distance")
+        pd.concat([active, completed])
+        .drop_duplicates()
         .sort_index()
     )
 
@@ -576,6 +1033,8 @@ def add_zone_trace(
     fill_color: str,
     border_color: str,
     show_legend: bool,
+    display_text: str | None = None,
+    details: str = "",
 ) -> None:
     """
     Draw a zone without permanent text.
@@ -605,6 +1064,9 @@ def add_zone_trace(
         label,
     )
 
+    if display_text is not None:
+        short_label = display_text
+
     fig.add_trace(
         go.Scatter(
             x=[
@@ -621,19 +1083,7 @@ def add_zone_trace(
                 top,
                 bottom,
             ],
-            mode="lines+text",
-            text=[
-                None,
-                None,
-                f"<b>{short_label}</b>",
-                None,
-                None,
-            ],
-            textposition="top left",
-            textfont={
-                "color": border_color,
-                "size": 11,
-            },
+            mode="lines",
             fill="toself",
             fillcolor=fill_color,
             line={
@@ -650,10 +1100,54 @@ def add_zone_trace(
                 f"Bottom: {bottom:.2f}<br>"
                 f"Size: {top - bottom:.2f}<br>"
                 f"Created: {start_time}<br>"
+                f"{details}"
                 "<extra></extra>"
             ),
         )
     )
+
+    middle_time = (
+        start_time
+        + (end_time - start_time) / 2
+    )
+    middle_price = (top + bottom) / 2
+
+    fig.add_trace(
+        go.Scatter(
+            x=[middle_time],
+            y=[middle_price],
+            mode="text",
+            text=[f"<b>{short_label}</b>"],
+            textposition="middle center",
+            textfont={
+                "color": border_color,
+                "size": 10,
+            },
+            name=f"{label} label",
+            legendgroup=legend_group,
+            showlegend=False,
+            hoverinfo="skip",
+        )
+    )
+
+
+def format_compact_number(
+    value,
+) -> str:
+    """Format large indicator values for compact labels."""
+
+    value = float(value)
+
+    for threshold, suffix in [
+        (1_000_000_000_000, "T"),
+        (1_000_000_000, "B"),
+        (1_000_000, "M"),
+        (1_000, "k"),
+    ]:
+        if abs(value) >= threshold:
+            return f"{value / threshold:.2f}{suffix}"
+
+    return f"{value:.0f}"
 
 
 def add_structure_markers(
@@ -663,7 +1157,7 @@ def add_structure_markers(
     signal_column: str,
     definitions,
 ) -> None:
-    """Add BOS or CHoCH markers without permanent text."""
+    """Draw each structure level from formation to break."""
 
     required_columns = {
         signal_column,
@@ -685,9 +1179,7 @@ def add_structure_markers(
             rows[signal_column] == direction
         ]
 
-        signal_times = []
-        signal_levels = []
-        hover_text = []
+        show_legend = True
 
         for _, row in selected.iterrows():
 
@@ -704,34 +1196,840 @@ def add_structure_markers(
                 row["Structure_Level"]
             )
 
-            signal_times.append(signal_time)
-            signal_levels.append(level)
-
-            hover_text.append(
-                f"<b>{label}</b><br>"
-                f"Level: {level:.2f}<br>"
-                f"Time: {signal_time}"
+            start_time = max(
+                row["time"],
+                first_time,
             )
+
+            middle_time = (
+                start_time
+                + (signal_time - start_time) / 2
+            )
+
+            fig.add_trace(
+                go.Scatter(
+                    x=[
+                        start_time,
+                        middle_time,
+                        signal_time,
+                    ],
+                    y=[level, level, level],
+                    mode="lines+markers+text",
+                    line={
+                        "color": color,
+                        "width": 2.1,
+                        "dash": (
+                            "dash"
+                            if signal_column == "Structure_CHOCH"
+                            else "solid"
+                        ),
+                    },
+                    marker={
+                        "symbol": symbol,
+                        "size": [0, 0, 14],
+                        "color": color,
+                        "line": {
+                            "color": "white",
+                            "width": 1.3,
+                        },
+                    },
+                    text=[None, f"<b>{label}</b>", None],
+                    textposition=(
+                        "top center"
+                        if direction == 1
+                        else "bottom center"
+                    ),
+                    textfont={
+                        "color": color,
+                        "size": 10,
+                    },
+                    name=label,
+                    legendgroup=f"structure_{label}",
+                    showlegend=show_legend,
+                    hovertemplate=(
+                        f"<b>{label}</b><br>"
+                        f"Level: {level:.2f}<br>"
+                        f"Formed: {row['time']}<br>"
+                        f"Broken: {signal_time}"
+                        "<extra></extra>"
+                    ),
+                )
+            )
+
+            show_legend = False
+
+
+def add_liquidity_sweeps(
+    fig: go.Figure,
+    data: pd.DataFrame,
+    first_time,
+    last_time,
+    maximum_sweeps: int = 10,
+) -> None:
+    """Draw recent paths from liquidity pools to sweep candles."""
+
+    required_columns = {
+        "Liquidity_Liquidity",
+        "Liquidity_Level",
+        "Liquidity_End",
+        "Liquidity_Swept",
+    }
+
+    if not required_columns.issubset(data.columns):
+        return
+
+    rows = data[
+        data["Liquidity_Liquidity"].fillna(0).ne(0)
+        & data["Liquidity_Level"].notna()
+        & data["Liquidity_End"].notna()
+        & data["Liquidity_Swept"].fillna(0).gt(0)
+    ].tail(maximum_sweeps * 3)
+
+    visible_rows = []
+
+    for _, row in rows.iterrows():
+        swept_time = get_index_time(
+            data,
+            row["Liquidity_Swept"],
+            row["time"],
+        )
+
+        if first_time <= swept_time <= last_time:
+            visible_rows.append(row)
+
+    show_legend = True
+
+    for row in visible_rows[-maximum_sweeps:]:
+        swept_index = int(
+            row["Liquidity_Swept"]
+        )
+
+        end_time = max(
+            get_index_time(
+                data,
+                row["Liquidity_End"],
+                row["time"],
+            ),
+            first_time,
+        )
+
+        swept_time = get_index_time(
+            data,
+            swept_index,
+            row["time"],
+        )
+
+        level = float(
+            row["Liquidity_Level"]
+        )
+
+        target = float(
+            data.iloc[swept_index][
+                "high"
+                if row["Liquidity_Liquidity"] == 1
+                else "low"
+            ]
+        )
+
+        middle_time = (
+            end_time
+            + (swept_time - end_time) / 2
+        )
+
+        middle_price = (level + target) / 2
 
         fig.add_trace(
             go.Scatter(
-                x=signal_times,
-                y=signal_levels,
-                mode="markers",
-                marker={
-                    "symbol": symbol,
-                    "size": 16,
-                    "color": color,
-                    "line": {
-                        "color": "white",
-                        "width": 1.5,
-                    },
+                x=[end_time, middle_time, swept_time],
+                y=[level, middle_price, target],
+                mode="lines+markers+text",
+                line={
+                    "color": "rgba(255, 70, 85, 0.88)",
+                    "width": 2,
+                    "dash": "dash",
                 },
-                name=label,
-                hovertext=hover_text,
-                hoverinfo="text",
+                marker={
+                    "size": [0, 0, 9],
+                    "color": "#ff4655",
+                    "symbol": "x",
+                },
+                text=[None, "<b>SWEEP</b>", None],
+                textposition="top center",
+                textfont={
+                    "color": "#ff6b78",
+                    "size": 9,
+                },
+                name="Liquidity Sweep",
+                legendgroup="liquidity_sweeps",
+                showlegend=show_legend,
+                hovertemplate=(
+                    "<b>Liquidity Sweep</b><br>"
+                    f"Level: {level:.2f}<br>"
+                    f"Sweep price: {target:.2f}<br>"
+                    f"Time: {swept_time}"
+                    "<extra></extra>"
+                ),
             )
         )
+
+        show_legend = False
+
+
+def add_previous_level_segments(
+    fig: go.Figure,
+    data: pd.DataFrame,
+) -> None:
+    """Draw historical previous four-hour highs and lows."""
+
+    definitions = [
+        ("FourHour_PreviousHigh", "PH", "#a9b4bf"),
+        ("FourHour_PreviousLow", "PL", "#7f8b97"),
+    ]
+
+    show_legend = True
+
+    for column, label, color in definitions:
+        if column not in data.columns:
+            continue
+
+        values = data[column]
+        groups = values.ne(values.shift()).cumsum()
+
+        for _, rows in data[
+            values.notna()
+        ].groupby(groups[values.notna()]):
+            level = float(rows[column].iloc[0])
+            start_time = rows["time"].iloc[0]
+            end_time = (
+                rows["time"].iloc[-1]
+                + pd.Timedelta(minutes=TIMEFRAME_MINUTES)
+            )
+
+            fig.add_trace(
+                go.Scatter(
+                    x=[start_time, end_time],
+                    y=[level, level],
+                    mode="lines+text",
+                    text=[None, f"<b>{label}</b>"],
+                    textposition=(
+                        "top left"
+                        if label == "PH"
+                        else "bottom left"
+                    ),
+                    textfont={
+                        "color": color,
+                        "size": 9,
+                    },
+                    line={
+                        "color": color,
+                        "width": 1.25,
+                        "dash": "dot",
+                    },
+                    opacity=0.58,
+                    name="Previous 4H Levels",
+                    legendgroup="previous_4h",
+                    showlegend=show_legend,
+                    hovertemplate=(
+                        f"<b>{label}</b><br>"
+                        f"Level: {level:.2f}"
+                        "<extra></extra>"
+                    ),
+                )
+            )
+
+            show_legend = False
+
+
+def add_retracement_annotations(
+    fig: go.Figure,
+    data: pd.DataFrame,
+    maximum_labels: int = 8,
+) -> None:
+    """Label completed swing legs with current/deepest retracement."""
+
+    required_columns = {
+        "Retracement_Direction",
+        "Retracement_CurrentRetracement%",
+        "Retracement_DeepestRetracement%",
+    }
+
+    if not required_columns.issubset(data.columns):
+        return
+
+    direction = data["Retracement_Direction"].fillna(0)
+    turns = data[
+        direction.ne(0)
+        & direction.ne(direction.shift(-1).fillna(0))
+    ].tail(maximum_labels)
+
+    if turns.empty:
+        return
+
+    x_values = []
+    y_values = []
+    labels = []
+    hover_values = []
+
+    for _, row in turns.iterrows():
+        current = float(
+            row["Retracement_CurrentRetracement%"]
+        )
+        deepest = float(
+            row["Retracement_DeepestRetracement%"]
+        )
+
+        x_values.append(row["time"])
+        y_values.append(
+            row["high"]
+            if row["Retracement_Direction"] == -1
+            else row["low"]
+        )
+        labels.append(
+            f"C:{current:.1f}%<br>D:{deepest:.1f}%"
+        )
+        hover_values.append(
+            f"Current: {current:.1f}%<br>"
+            f"Deepest: {deepest:.1f}%"
+        )
+
+    fig.add_trace(
+        go.Scatter(
+            x=x_values,
+            y=y_values,
+            mode="markers+text",
+            marker={
+                "size": 5,
+                "color": "#d7dde4",
+            },
+            text=labels,
+            textposition="top center",
+            textfont={
+                "color": "rgba(225, 232, 240, 0.72)",
+                "size": 9,
+            },
+            name="Retracement Turns",
+            legendgroup="retracements",
+            hovertext=hover_values,
+            hoverinfo="text",
+        )
+    )
+
+
+# =========================================================
+# CREATE MPLFINANCE SNAPSHOT
+# =========================================================
+
+def create_mplfinance_snapshot(
+    results: pd.DataFrame,
+    number_of_candles: int = MPLFINANCE_CANDLES,
+) -> Path:
+    """Create a clean high-resolution SMC chart with mplfinance."""
+
+    data = results.copy().reset_index(drop=True)
+    data["time"] = pd.to_datetime(data["time"])
+
+    chart_data = data.tail(number_of_candles).copy()
+
+    if chart_data.empty:
+        raise ValueError(
+            "No candles are available for the mplfinance snapshot."
+        )
+
+    first_index = int(chart_data.index[0])
+    last_index = int(chart_data.index[-1])
+    candle_total = len(chart_data)
+    first_time = chart_data["time"].iloc[0]
+    current_price = float(chart_data["close"].iloc[-1])
+
+    ohlcv = (
+        chart_data
+        .set_index("time")
+        [["open", "high", "low", "close", "volume"]]
+        .rename(
+            columns={
+                "open": "Open",
+                "high": "High",
+                "low": "Low",
+                "close": "Close",
+                "volume": "Volume",
+            }
+        )
+    )
+
+    market_colors = mpf.make_marketcolors(
+        up="#19c9a5",
+        down="#ff4d5b",
+        edge="inherit",
+        wick={
+            "up": "#4ee8c8",
+            "down": "#ff7480",
+        },
+        volume={
+            "up": "#167f6d",
+            "down": "#9f3742",
+        },
+    )
+
+    chart_style = mpf.make_mpf_style(
+        base_mpf_style="nightclouds",
+        marketcolors=market_colors,
+        facecolor="#101215",
+        figcolor="#101215",
+        gridcolor="#29313a",
+        gridstyle="-",
+        y_on_right=True,
+        rc={
+            "axes.edgecolor": "#46515c",
+            "axes.labelcolor": "#c9d4de",
+            "text.color": "#e8eef4",
+            "xtick.color": "#a9b5c0",
+            "ytick.color": "#a9b5c0",
+            "font.size": 9,
+        },
+    )
+
+    figure, axes = mpf.plot(
+        ohlcv,
+        type="candle",
+        style=chart_style,
+        volume=True,
+        returnfig=True,
+        figsize=(18, 10),
+        panel_ratios=(5, 1),
+        datetime_format="%b %d %H:%M",
+        xrotation=0,
+        ylabel="Gold price",
+        ylabel_lower="Tick volume",
+        scale_width_adjustment={
+            "candle": 0.85,
+            "volume": 0.75,
+        },
+    )
+
+    price_axis = axes[0]
+
+    # Session rectangles stay behind the SMC zones and candles.
+    for session_name, session_color in {
+        "London": "#2d91ff",
+        "NewYork": "#ff9b2d",
+    }.items():
+        active_column = f"Session_{session_name}_Active"
+        high_column = f"Session_{session_name}_High"
+        low_column = f"Session_{session_name}_Low"
+
+        if not {
+            active_column,
+            high_column,
+            low_column,
+        }.issubset(chart_data.columns):
+            continue
+
+        active = chart_data[active_column].fillna(0).eq(1)
+        session_groups = active.ne(active.shift()).cumsum()
+
+        for _, session_rows in chart_data[active].groupby(
+            session_groups[active]
+        ):
+            positive_lows = session_rows.loc[
+                session_rows[low_column] > 0,
+                low_column,
+            ]
+
+            if positive_lows.empty:
+                continue
+
+            x_start = float(session_rows.index[0] - first_index) - 0.45
+            x_end = float(session_rows.index[-1] - first_index) + 0.45
+            session_low = float(positive_lows.min())
+            session_high = float(session_rows[high_column].max())
+
+            price_axis.add_patch(
+                Rectangle(
+                    (x_start, session_low),
+                    max(x_end - x_start, 0.2),
+                    max(session_high - session_low, 0.01),
+                    facecolor=to_rgba(session_color, 0.045),
+                    edgecolor=to_rgba(session_color, 0.18),
+                    linewidth=0.7,
+                    zorder=0.4,
+                )
+            )
+
+    zone_specs = [
+        {
+            "signal": "FVG_FVG",
+            "top": "FVG_Top",
+            "bottom": "FVG_Bottom",
+            "mitigation": "FVG_MitigatedIndex",
+            "maximum": max(MAX_FVG_ZONES, 20),
+            "name": "FVG",
+            "bull": "#00dc79",
+            "bear": "#ff4d5b",
+            "hatch": None,
+        },
+        {
+            "signal": "OB_OB",
+            "top": "OB_Top",
+            "bottom": "OB_Bottom",
+            "mitigation": "OB_MitigatedIndex",
+            "maximum": max(MAX_OB_ZONES, 12),
+            "name": "OB",
+            "bull": "#5d9cff",
+            "bear": "#ff9b2d",
+            "hatch": "///",
+        },
+    ]
+
+    for spec in zone_specs:
+        zones = select_chart_zones(
+            data=data,
+            signal_column=spec["signal"],
+            top_column=spec["top"],
+            bottom_column=spec["bottom"],
+            mitigation_column=spec["mitigation"],
+            current_price=current_price,
+            first_time=first_time,
+            maximum_zones=spec["maximum"],
+        )
+
+        for source_index, row in zones.iterrows():
+            bullish = float(row[spec["signal"]]) == 1
+            active_zone = bool(row["_active"])
+            zone_color = spec["bull"] if bullish else spec["bear"]
+            end_index = (
+                last_index
+                if active_zone
+                else int(row["_end_index"])
+            )
+            x_start = max(float(source_index - first_index) - 0.42, -0.5)
+            x_end = min(float(end_index - first_index) + 0.42, candle_total - 0.5)
+            bottom = float(row[spec["bottom"]])
+            top = float(row[spec["top"]])
+
+            if top < bottom:
+                top, bottom = bottom, top
+
+            if x_end <= x_start or top <= bottom:
+                continue
+
+            price_axis.add_patch(
+                Rectangle(
+                    (x_start, bottom),
+                    x_end - x_start,
+                    top - bottom,
+                    facecolor=to_rgba(
+                        zone_color,
+                        0.17 if active_zone else 0.065,
+                    ),
+                    edgecolor=to_rgba(
+                        zone_color,
+                        0.9 if active_zone else 0.38,
+                    ),
+                    linewidth=1.15 if active_zone else 0.8,
+                    linestyle="-" if active_zone else "--",
+                    hatch=spec["hatch"] if active_zone else None,
+                    zorder=1.0,
+                )
+            )
+
+            if x_start >= -0.5 and x_end - x_start >= 7:
+                direction = "UP" if bullish else "DOWN"
+                status = "" if active_zone else " filled"
+                price_axis.text(
+                    x_start + 0.8,
+                    top,
+                    f"{spec['name']} {direction}{status}",
+                    color=to_rgba(zone_color, 0.95),
+                    fontsize=6.8,
+                    fontweight="bold",
+                    va="bottom",
+                    clip_on=True,
+                    zorder=3.2,
+                )
+
+    liquidity_rows = select_nearest_active_liquidity(
+        data=data,
+        current_price=current_price,
+        maximum_levels=MAX_LIQUIDITY_LEVELS,
+    )
+
+    for source_index, row in liquidity_rows.iterrows():
+        level = float(row["Liquidity_Level"])
+        bullish = float(row["Liquidity_Liquidity"]) == 1
+        line_color = "#d95cff" if bullish else "#ffee00"
+        label = "BSL" if bullish else "SSL"
+        x_start = max(float(source_index - first_index), 0)
+
+        price_axis.plot(
+            [x_start, candle_total - 0.5],
+            [level, level],
+            color=line_color,
+            linewidth=1.2,
+            linestyle=(0, (4, 3)),
+            alpha=0.88,
+            zorder=2.1,
+        )
+        price_axis.text(
+            candle_total - 1.0,
+            level,
+            label,
+            color=line_color,
+            fontsize=7,
+            fontweight="bold",
+            ha="right",
+            va="bottom",
+            clip_on=True,
+            zorder=3.5,
+        )
+
+    visible_swings = chart_data[
+        chart_data["Swing_HighLow"].fillna(0).ne(0)
+        & chart_data["Swing_Level"].notna()
+    ].tail(MAX_SWING_MARKERS)
+
+    if not visible_swings.empty:
+        swing_x = visible_swings.index.to_numpy() - first_index
+        swing_y = visible_swings["Swing_Level"].astype(float).to_numpy()
+
+        price_axis.plot(
+            swing_x,
+            swing_y,
+            color=to_rgba("#d2d9e0", 0.43),
+            linewidth=0.95,
+            zorder=2.0,
+        )
+
+        for direction, color, marker in [
+            (1, "#69d7ff", "v"),
+            (-1, "#ff77d4", "^"),
+        ]:
+            selected = visible_swings[
+                visible_swings["Swing_HighLow"] == direction
+            ]
+
+            price_axis.scatter(
+                selected.index.to_numpy() - first_index,
+                selected["Swing_Level"].astype(float),
+                s=24,
+                marker=marker,
+                facecolors="none",
+                edgecolors=color,
+                linewidths=1.0,
+                zorder=3.0,
+            )
+
+    structure_rows = data[
+        (
+            data["Structure_BOS"].fillna(0).ne(0)
+            | data["Structure_CHOCH"].fillna(0).ne(0)
+        )
+        & data["Structure_BrokenIndex"].notna()
+        & data["Structure_Level"].notna()
+    ].tail(24)
+
+    for _, row in structure_rows.iterrows():
+        broken_index = int(row["Structure_BrokenIndex"])
+
+        if not first_index <= broken_index <= last_index:
+            continue
+
+        bos_value = row["Structure_BOS"]
+        is_bos = pd.notna(bos_value) and float(bos_value) != 0
+        direction_value = (
+            float(bos_value)
+            if is_bos
+            else float(row["Structure_CHOCH"])
+        )
+        label = "BOS" if is_bos else "CHoCH"
+        color = (
+            "#00e676" if is_bos and direction_value == 1
+            else "#ff1744" if is_bos
+            else "#00e5ff" if direction_value == 1
+            else "#ffb300"
+        )
+        marker = "^" if direction_value == 1 else "v"
+        level = float(row["Structure_Level"])
+        x_value = broken_index - first_index
+
+        price_axis.scatter(
+            [x_value],
+            [level],
+            s=34,
+            marker=marker if is_bos else "D",
+            facecolors=to_rgba(color, 0.28),
+            edgecolors=color,
+            linewidths=1.1,
+            zorder=3.8,
+        )
+        price_axis.annotate(
+            label,
+            (x_value, level),
+            xytext=(0, 8 if direction_value == 1 else -11),
+            textcoords="offset points",
+            ha="center",
+            va="bottom" if direction_value == 1 else "top",
+            color=color,
+            fontsize=6.8,
+            fontweight="bold",
+            clip_on=True,
+            zorder=4.0,
+        )
+
+    for column, label, color in [
+        ("Daily_PreviousHigh", "PDH", "#00e5ff"),
+        ("Daily_PreviousLow", "PDL", "#ff55eb"),
+        ("FourHour_PreviousHigh", "P4H", "#aeb8c2"),
+        ("FourHour_PreviousLow", "P4L", "#7f8b97"),
+    ]:
+        value = latest_value(chart_data, column)
+
+        if value is None or pd.isna(value):
+            continue
+
+        level = float(value)
+        price_axis.axhline(
+            level,
+            color=color,
+            linewidth=0.9,
+            linestyle=(0, (6, 4)),
+            alpha=0.72,
+            zorder=1.8,
+        )
+        price_axis.text(
+            candle_total - 1.0,
+            level,
+            f"{label} {level:.2f}",
+            color=color,
+            fontsize=6.7,
+            ha="right",
+            va="bottom",
+            clip_on=True,
+            zorder=3.4,
+        )
+
+    price_axis.axhline(
+        current_price,
+        color="#f4f7fa",
+        linewidth=1.0,
+        linestyle=(0, (2, 3)),
+        alpha=0.9,
+        zorder=2.2,
+    )
+    price_axis.text(
+        candle_total - 1.0,
+        current_price,
+        f"PRICE {current_price:.2f}",
+        color="#ffffff",
+        fontsize=7.2,
+        fontweight="bold",
+        ha="right",
+        va="bottom",
+        clip_on=True,
+        zorder=4.0,
+    )
+
+    candle_low = float(chart_data["low"].min())
+    candle_high = float(chart_data["high"].max())
+    padding = max((candle_high - candle_low) * 0.065, 0.5)
+    price_axis.set_ylim(
+        candle_low - padding,
+        candle_high + padding,
+    )
+    price_axis.set_xlim(-1.0, candle_total + 2.0)
+    price_axis.set_title(
+        f"{SYMBOL} {TIMEFRAME_NAME} | Smart Money Concepts | "
+        f"Completed {chart_data['time'].iloc[-1]}",
+        color="#f0f5f9",
+        fontsize=14,
+        fontweight="bold",
+        loc="left",
+        pad=12,
+    )
+
+    legend_handles = [
+        Patch(
+            facecolor=to_rgba("#00dc79", 0.18),
+            edgecolor="#00dc79",
+            label="Bullish FVG",
+        ),
+        Patch(
+            facecolor=to_rgba("#ff4d5b", 0.18),
+            edgecolor="#ff4d5b",
+            label="Bearish FVG",
+        ),
+        Patch(
+            facecolor=to_rgba("#5d9cff", 0.18),
+            edgecolor="#5d9cff",
+            hatch="///",
+            label="Bullish OB",
+        ),
+        Patch(
+            facecolor=to_rgba("#ff9b2d", 0.18),
+            edgecolor="#ff9b2d",
+            hatch="///",
+            label="Bearish OB",
+        ),
+        Line2D(
+            [0],
+            [0],
+            color="#d95cff",
+            linestyle="--",
+            label="Buy-side liquidity",
+        ),
+        Line2D(
+            [0],
+            [0],
+            color="#ffee00",
+            linestyle="--",
+            label="Sell-side liquidity",
+        ),
+    ]
+    legend = price_axis.legend(
+        handles=legend_handles,
+        loc="upper left",
+        ncol=3,
+        frameon=True,
+        fontsize=7.5,
+        borderpad=0.7,
+    )
+    legend.get_frame().set_facecolor(to_rgba("#101215", 0.88))
+    legend.get_frame().set_edgecolor("#46515c")
+
+    figure.text(
+        0.08,
+        0.025,
+        retracement_status(chart_data)
+        + " | Shaded rectangles are separate zones; faded dashed zones are mitigated.",
+        color="#aab6c1",
+        fontsize=8.5,
+    )
+    figure.subplots_adjust(
+        left=0.06,
+        right=0.93,
+        top=0.91,
+        bottom=0.10,
+        hspace=0.08,
+    )
+
+    output_path = Path(MPLFINANCE_OUTPUT_FILE).resolve()
+    temporary_output_path = output_path.with_name(
+        f"{output_path.stem}.tmp{output_path.suffix}"
+    )
+
+    try:
+        figure.savefig(
+            temporary_output_path,
+            format="png",
+            dpi=165,
+            facecolor=figure.get_facecolor(),
+            bbox_inches="tight",
+        )
+        temporary_output_path.replace(output_path)
+    finally:
+        plt.close(figure)
+        temporary_output_path.unlink(missing_ok=True)
+
+    return output_path
 
 
 # =========================================================
@@ -805,33 +2103,69 @@ def create_interactive_chart(
     shown_groups = set()
 
     # -----------------------------------------------------
-    # ACTIVE FAIR VALUE GAPS
+    # ACTIVE AND RECENTLY MITIGATED FAIR VALUE GAPS
     # -----------------------------------------------------
 
-    fvg_zones = select_nearest_active_zones(
+    fvg_zones = select_chart_zones(
         data=data,
         signal_column="FVG_FVG",
         top_column="FVG_Top",
         bottom_column="FVG_Bottom",
         mitigation_column="FVG_MitigatedIndex",
         current_price=current_price,
+        first_time=first_time,
         maximum_zones=MAX_FVG_ZONES,
     )
 
     for _, row in fvg_zones.iterrows():
 
         bullish = row["FVG_FVG"] == 1
+        is_active = bool(row["_active"])
+        zone_end = (
+            last_time
+            if is_active
+            else row["_end_time"]
+        )
 
         if bullish:
             label = "Bullish FVG"
             group = "bullish_fvg"
-            fill_color = "rgba(0,205,110,0.27)"
-            border_color = "rgba(0,240,130,0.95)"
+            fill_color = (
+                "rgba(0,205,110,0.27)"
+                if is_active
+                else "rgba(0,205,110,0.10)"
+            )
+            border_color = (
+                "rgba(0,240,130,0.95)"
+                if is_active
+                else "rgba(0,240,130,0.46)"
+            )
         else:
             label = "Bearish FVG"
             group = "bearish_fvg"
-            fill_color = "rgba(235,55,75,0.27)"
-            border_color = "rgba(255,75,95,0.95)"
+            fill_color = (
+                "rgba(235,55,75,0.27)"
+                if is_active
+                else "rgba(235,55,75,0.10)"
+            )
+            border_color = (
+                "rgba(255,75,95,0.95)"
+                if is_active
+                else "rgba(255,75,95,0.46)"
+            )
+
+        direction_symbol = "▲" if bullish else "▼"
+        display_text = (
+            f"FVG {direction_symbol}"
+            if is_active
+            else f"FVG {direction_symbol} · filled"
+        )
+
+        details = (
+            "Status: Active<br>"
+            if is_active
+            else f"Status: Mitigated<br>Filled: {zone_end}<br>"
+        )
 
         add_zone_trace(
             fig=fig,
@@ -839,7 +2173,7 @@ def create_interactive_chart(
                 row["time"],
                 first_time,
             ),
-            end_time=last_time,
+            end_time=zone_end,
             bottom=row["FVG_Bottom"],
             top=row["FVG_Top"],
             label=label,
@@ -847,38 +2181,88 @@ def create_interactive_chart(
             fill_color=fill_color,
             border_color=border_color,
             show_legend=group not in shown_groups,
+            display_text=display_text,
+            details=details,
         )
 
         shown_groups.add(group)
 
     # -----------------------------------------------------
-    # ACTIVE ORDER BLOCKS
+    # ACTIVE AND RECENTLY MITIGATED ORDER BLOCKS
     # -----------------------------------------------------
 
-    order_block_zones = select_nearest_active_zones(
+    order_block_zones = select_chart_zones(
         data=data,
         signal_column="OB_OB",
         top_column="OB_Top",
         bottom_column="OB_Bottom",
         mitigation_column="OB_MitigatedIndex",
         current_price=current_price,
+        first_time=first_time,
         maximum_zones=MAX_OB_ZONES,
     )
 
     for _, row in order_block_zones.iterrows():
 
         bullish = row["OB_OB"] == 1
+        is_active = bool(row["_active"])
+        zone_end = (
+            last_time
+            if is_active
+            else row["_end_time"]
+        )
 
         if bullish:
             label = "Bullish Order Block"
             group = "bullish_ob"
-            fill_color = "rgba(35,125,255,0.27)"
-            border_color = "rgba(65,160,255,0.95)"
+            fill_color = (
+                "rgba(35,125,255,0.27)"
+                if is_active
+                else "rgba(35,125,255,0.10)"
+            )
+            border_color = (
+                "rgba(65,160,255,0.95)"
+                if is_active
+                else "rgba(65,160,255,0.46)"
+            )
         else:
             label = "Bearish Order Block"
             group = "bearish_ob"
-            fill_color = "rgba(255,140,25,0.27)"
-            border_color = "rgba(255,175,45,0.95)"
+            fill_color = (
+                "rgba(255,140,25,0.27)"
+                if is_active
+                else "rgba(255,140,25,0.10)"
+            )
+            border_color = (
+                "rgba(255,175,45,0.95)"
+                if is_active
+                else "rgba(255,175,45,0.46)"
+            )
+
+        percentage = float(
+            row.get("OB_Percentage", 0) or 0
+        )
+
+        volume = float(
+            row.get("OB_OBVolume", 0) or 0
+        )
+
+        direction_symbol = "▲" if bullish else "▼"
+        display_text = (
+            f"OB {direction_symbol} {percentage:.0f}%"
+            if is_active
+            else f"OB {direction_symbol} {percentage:.0f}% · mitigated"
+        )
+
+        details = (
+            f"Volume: {format_compact_number(volume)}<br>"
+            f"Strength: {percentage:.1f}%<br>"
+            + (
+                "Status: Active<br>"
+                if is_active
+                else f"Status: Mitigated<br>Filled: {zone_end}<br>"
+            )
+        )
 
         add_zone_trace(
             fig=fig,
@@ -886,7 +2270,7 @@ def create_interactive_chart(
                 row["time"],
                 first_time,
             ),
-            end_time=last_time,
+            end_time=zone_end,
             bottom=row["OB_Bottom"],
             top=row["OB_Top"],
             label=label,
@@ -894,6 +2278,8 @@ def create_interactive_chart(
             fill_color=fill_color,
             border_color=border_color,
             show_legend=group not in shown_groups,
+            display_text=display_text,
+            details=details,
         )
 
         shown_groups.add(group)
@@ -968,6 +2354,18 @@ def create_interactive_chart(
 
         shown_groups.add(group)
 
+    add_liquidity_sweeps(
+        fig=fig,
+        data=data,
+        first_time=first_time,
+        last_time=last_time,
+    )
+
+    add_previous_level_segments(
+        fig=fig,
+        data=chart_data,
+    )
+
     # -----------------------------------------------------
     # SWING HIGHS AND LOWS
     # -----------------------------------------------------
@@ -1025,6 +2423,11 @@ def create_interactive_chart(
                 "diamond",
             ),
         ],
+    )
+
+    add_retracement_annotations(
+        fig=fig,
+        data=chart_data,
     )
 
     # -----------------------------------------------------
@@ -1121,8 +2524,8 @@ def create_interactive_chart(
                 f"<b>{SYMBOL} {TIMEFRAME_NAME}</b>"
                 "<br>"
                 "<sup>"
-                "Hover over zones for details. "
-                "Click legend items to hide or show groups."
+                "Hover or tap for details · Drag to pan · "
+                "Use Indicators to organize overlays"
                 "</sup>"
             ),
             "x": 0.5,
@@ -1135,6 +2538,7 @@ def create_interactive_chart(
         uirevision="smc-responsive-chart",
         hoverdistance=30,
         spikedistance=-1,
+        showlegend=False,
         paper_bgcolor="#101215",
         plot_bgcolor="#101215",
         xaxis_title="Time",
@@ -1188,34 +2592,6 @@ def create_interactive_chart(
         rangeslider={
             "visible": True,
             "thickness": 0.07,
-        },
-        rangeselector={
-            "buttons": [
-                {
-                    "count": 1,
-                    "label": "1D",
-                    "step": "day",
-                    "stepmode": "backward",
-                },
-                {
-                    "count": 3,
-                    "label": "3D",
-                    "step": "day",
-                    "stepmode": "backward",
-                },
-                {
-                    "count": 7,
-                    "label": "1W",
-                    "step": "day",
-                    "stepmode": "backward",
-                },
-                {
-                    "step": "all",
-                    "label": "All",
-                },
-            ],
-            "x": 0,
-            "y": 1.08,
         },
         gridcolor="#29313a",
         showspikes=True,
@@ -1276,17 +2652,57 @@ def create_interactive_chart(
 (() => {
     const plot = document.getElementById("smc-chart");
     const shell = document.getElementById("chart-shell");
+    const indicatorButton = document.getElementById("chart-indicators");
+    const indicatorPanel = document.getElementById("indicator-panel");
+    const closePanelButton = document.getElementById("close-indicators");
+    const oneDayButton = document.getElementById("chart-1d");
     const latestButton = document.getElementById("chart-latest");
+    const oneWeekButton = document.getElementById("chart-1w");
     const fitButton = document.getElementById("chart-fit");
     const yZoomInButton = document.getElementById("chart-y-in");
     const yZoomOutButton = document.getElementById("chart-y-out");
     const yAutoButton = document.getElementById("chart-y-auto");
+    const exportButton = document.getElementById("chart-export");
+    const mplfinanceButton = document.getElementById("chart-mplfinance");
+    const summaryButton = document.getElementById("chart-summary-button");
     const fullscreenButton = document.getElementById("chart-fullscreen");
+    const helpButton = document.getElementById("chart-help-button");
+    const helpDialog = document.getElementById("chart-help");
+    const closeHelpButton = document.getElementById("close-help");
+    const showAllButton = document.getElementById("show-all-layers");
+    const focusButton = document.getElementById("focus-price");
+    const layerToggles = [...document.querySelectorAll("[data-layer]")];
+    const labelsToggle = document.getElementById("toggle-labels");
+    const gridToggle = document.getElementById("toggle-grid");
+    const crosshairToggle = document.getElementById("toggle-crosshair");
+    const sliderToggle = document.getElementById("toggle-slider");
+    const liveBadge = document.getElementById("live-badge");
 
     if (!plot || !shell) return;
 
     const fullRange = ["__FIRST_TIME__", "__RANGE_END__"];
     const latestRange = ["__LATEST_START__", "__RANGE_END__"];
+    const lastTimestamp = new Date("__LAST_TIME__");
+    const originalText = plot.data.map((trace) => trace.text);
+    const layerDefinitions = {
+        fvg: ["bullish_fvg", "bearish_fvg"],
+        orderblocks: ["bullish_ob", "bearish_ob"],
+        liquidity: [
+            "buy_side_liquidity",
+            "sell_side_liquidity",
+            "liquidity_sweeps"
+        ],
+        structure: [
+            "structure_Bullish BOS",
+            "structure_Bearish BOS",
+            "structure_Bullish CHoCH",
+            "structure_Bearish CHoCH"
+        ],
+        swings: ["swings"],
+        levels: ["previous_4h"],
+        sessions: ["session_London", "session_NewYork"],
+        retracements: ["retracements"]
+    };
     let compactMode = null;
     let resizeFrame = null;
 
@@ -1304,9 +2720,6 @@ def create_interactive_chart(
                 : {l: 76, r: 132, t: 142, b: 76},
             "font.size": isCompact ? 11 : 13,
             "title.font.size": isCompact ? 15 : 18,
-            "legend.font.size": isCompact ? 9 : 11,
-            "legend.y": isCompact ? 1.03 : 1.02,
-            "xaxis.rangeselector.y": isCompact ? 1.14 : 1.08,
             "xaxis.title.text": isCompact ? "" : "Time",
             "yaxis.title.text": isCompact ? "" : "Gold Price"
         });
@@ -1345,11 +2758,208 @@ def create_interactive_chart(
         });
     }
 
+    function setTimeWindow(days) {
+        const start = new Date(
+            lastTimestamp.getTime() - days * 86400000
+        );
+
+        Plotly.relayout(plot, {
+            "xaxis.range": [start.toISOString(), fullRange[1]],
+            "yaxis.autorange": true
+        });
+    }
+
+    function setLayerVisibility(layerName, visible) {
+        const groups = layerDefinitions[layerName] || [];
+        const traceIndices = [];
+
+        plot.data.forEach((trace, index) => {
+            if (groups.includes(trace.legendgroup)) {
+                traceIndices.push(index);
+            }
+        });
+
+        if (traceIndices.length) {
+            Plotly.restyle(
+                plot,
+                {visible: visible ? true : "legendonly"},
+                traceIndices
+            );
+        }
+
+        const shapeUpdates = {};
+
+        (plot.layout.shapes || []).forEach((shape, index) => {
+            if (groups.includes(shape.legendgroup)) {
+                shapeUpdates[`shapes[${index}].visible`] = visible;
+            }
+        });
+
+        if (Object.keys(shapeUpdates).length) {
+            Plotly.relayout(plot, shapeUpdates);
+        }
+    }
+
+    function setAllLayers(visible) {
+        layerToggles.forEach((toggle) => {
+            toggle.checked = visible;
+            setLayerVisibility(toggle.dataset.layer, visible);
+        });
+    }
+
+    function setLabelsVisibility(visible) {
+        plot.data.forEach((trace, index) => {
+            if (originalText[index] === undefined) return;
+
+            const replacement = visible
+                ? originalText[index]
+                : Array.isArray(originalText[index])
+                ? originalText[index].map(() => null)
+                : null;
+
+            Plotly.restyle(
+                plot,
+                {text: [replacement]},
+                [index]
+            );
+        });
+    }
+
+    function toggleIndicatorPanel(forceOpen) {
+        const shouldOpen = forceOpen ?? indicatorPanel.hidden;
+        indicatorPanel.hidden = !shouldOpen;
+        indicatorButton?.setAttribute(
+            "aria-expanded",
+            String(shouldOpen)
+        );
+    }
+
+    function saveChartView() {
+        try {
+            sessionStorage.setItem(
+                "smc-chart-view",
+                JSON.stringify({
+                    xRange: plot?._fullLayout?.xaxis?.range,
+                    yRange: plot?._fullLayout?.yaxis?.range
+                })
+            );
+        } catch (_) {
+            // Storage can be unavailable in privacy-restricted browsers.
+        }
+    }
+
+    function restoreChartView() {
+        try {
+            const saved = JSON.parse(
+                sessionStorage.getItem("smc-chart-view") || "null"
+            );
+
+            sessionStorage.removeItem("smc-chart-view");
+
+            if (!saved) return;
+
+            const update = {};
+
+            if (saved.xRange?.length === 2) {
+                update["xaxis.range"] = saved.xRange;
+            }
+
+            if (saved.yRange?.length === 2) {
+                update["yaxis.range"] = saved.yRange;
+                update["yaxis.autorange"] = false;
+            }
+
+            if (Object.keys(update).length) {
+                Plotly.relayout(plot, update);
+            }
+        } catch (_) {
+            // Ignore invalid or unavailable session storage.
+        }
+    }
+
+    let seenLiveVersion = null;
+
+    async function pollLiveStatus() {
+        if (location.protocol === "file:") {
+            if (liveBadge) {
+                liveBadge.dataset.state = "static";
+                liveBadge.textContent = "Static snapshot";
+            }
+            return;
+        }
+
+        try {
+            const response = await fetch(
+                "/api/status",
+                {cache: "no-store"}
+            );
+
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+
+            const status = await response.json();
+
+            if (liveBadge) {
+                liveBadge.dataset.state = status.error ? "error" : "live";
+                liveBadge.textContent = status.error
+                    ? `Live warning · ${status.error}`
+                    : `Live · ${status.last_candle_time || "waiting"}`;
+            }
+
+            if (
+                status.last_price !== null
+                && status.last_price !== undefined
+            ) {
+                const livePrice = document.getElementById(
+                    "live-current-price"
+                );
+
+                if (livePrice) {
+                    livePrice.textContent = Number(
+                        status.last_price
+                    ).toLocaleString(undefined, {
+                        minimumFractionDigits: 2,
+                        maximumFractionDigits: 2
+                    });
+                }
+            }
+
+            if (seenLiveVersion === null) {
+                seenLiveVersion = status.version;
+            } else if (status.version !== seenLiveVersion) {
+                saveChartView();
+                location.reload();
+            }
+        } catch (_) {
+            if (liveBadge) {
+                liveBadge.dataset.state = "error";
+                liveBadge.textContent = "Live disconnected";
+            }
+        }
+    }
+
+    indicatorButton?.addEventListener("click", () => {
+        toggleIndicatorPanel();
+    });
+
+    closePanelButton?.addEventListener("click", () => {
+        toggleIndicatorPanel(false);
+    });
+
+    oneDayButton?.addEventListener("click", () => {
+        setTimeWindow(1);
+    });
+
     latestButton?.addEventListener("click", () => {
         Plotly.relayout(plot, {
             "xaxis.range": latestRange,
             "yaxis.autorange": true
         });
+    });
+
+    oneWeekButton?.addEventListener("click", () => {
+        setTimeWindow(7);
     });
 
     fitButton?.addEventListener("click", () => {
@@ -1371,6 +2981,82 @@ def create_interactive_chart(
         Plotly.relayout(plot, {
             "yaxis.autorange": true
         });
+    });
+
+    layerToggles.forEach((toggle) => {
+        toggle.addEventListener("change", () => {
+            setLayerVisibility(
+                toggle.dataset.layer,
+                toggle.checked
+            );
+        });
+    });
+
+    showAllButton?.addEventListener("click", () => {
+        setAllLayers(true);
+    });
+
+    focusButton?.addEventListener("click", () => {
+        setAllLayers(false);
+    });
+
+    labelsToggle?.addEventListener("change", () => {
+        setLabelsVisibility(labelsToggle.checked);
+    });
+
+    gridToggle?.addEventListener("change", () => {
+        Plotly.relayout(plot, {
+            "xaxis.showgrid": gridToggle.checked,
+            "yaxis.showgrid": gridToggle.checked
+        });
+    });
+
+    crosshairToggle?.addEventListener("change", () => {
+        Plotly.relayout(plot, {
+            "xaxis.showspikes": crosshairToggle.checked,
+            "yaxis.showspikes": crosshairToggle.checked
+        });
+    });
+
+    sliderToggle?.addEventListener("change", () => {
+        Plotly.relayout(plot, {
+            "xaxis.rangeslider.visible": sliderToggle.checked
+        });
+        scheduleResize();
+    });
+
+    exportButton?.addEventListener("click", () => {
+        Plotly.downloadImage(plot, {
+            format: "png",
+            filename: "xauusd_m15_smc_chart",
+            width: 2200,
+            height: 1200,
+            scale: 2
+        });
+    });
+
+    mplfinanceButton?.addEventListener("click", () => {
+        const target = location.protocol === "file:"
+            ? "xauusd_m15_smc_snapshot.png"
+            : "/mplfinance";
+        window.open(target, "_blank", "noopener");
+    });
+
+    summaryButton?.addEventListener("click", () => {
+        document.getElementById("chart-summary")?.scrollIntoView({
+            behavior: "smooth",
+            block: "start"
+        });
+    });
+
+    helpButton?.addEventListener("click", () => {
+        if (helpDialog && !helpDialog.open) {
+            helpDialog.showModal();
+        }
+    });
+
+    closeHelpButton?.addEventListener("click", () => {
+        helpDialog?.close();
     });
 
     fullscreenButton?.addEventListener("click", async () => {
@@ -1396,9 +3082,18 @@ def create_interactive_chart(
         if (event.key.toLowerCase() === "l") latestButton?.click();
         if (event.key.toLowerCase() === "r") fitButton?.click();
         if (event.key.toLowerCase() === "f") fullscreenButton?.click();
+        if (event.key.toLowerCase() === "i") indicatorButton?.click();
+        if (event.key.toLowerCase() === "e") exportButton?.click();
+        if (event.key.toLowerCase() === "p") mplfinanceButton?.click();
+        if (event.key.toLowerCase() === "s") summaryButton?.click();
+        if (event.key.toLowerCase() === "h") helpButton?.click();
+        if (event.key === "1") oneDayButton?.click();
+        if (event.key === "3") latestButton?.click();
+        if (event.key === "7") oneWeekButton?.click();
         if (event.key === "+" || event.key === "=") yZoomInButton?.click();
         if (event.key === "-" || event.key === "_") yZoomOutButton?.click();
         if (event.key === "0") yAutoButton?.click();
+        if (event.key === "Escape") toggleIndicatorPanel(false);
     });
 
     window.addEventListener("resize", scheduleResize, {passive: true});
@@ -1408,6 +3103,12 @@ def create_interactive_chart(
     }
 
     applyResponsiveLayout();
+    restoreChartView();
+    pollLiveStatus();
+    window.setInterval(
+        pollLiveStatus,
+        __LIVE_REFRESH_MS__
+    );
 })();
 """
 
@@ -1424,6 +3125,14 @@ def create_interactive_chart(
         .replace(
             "__RANGE_END__",
             chart_range_end.isoformat(),
+        )
+        .replace(
+            "__LAST_TIME__",
+            last_time.isoformat(),
+        )
+        .replace(
+            "__LIVE_REFRESH_MS__",
+            str(LIVE_REFRESH_SECONDS * 1000),
         )
     )
 
@@ -1452,7 +3161,9 @@ def create_interactive_chart(
         width: 100%;
         height: 100%;
         margin: 0;
-        overflow: hidden;
+        overflow-x: hidden;
+        overflow-y: auto;
+        scroll-behavior: smooth;
         background: #101215;
     }
 
@@ -1475,7 +3186,7 @@ def create_interactive_chart(
     .chart-actions {
         position: absolute;
         z-index: 20;
-        top: max(8px, env(safe-area-inset-top));
+        top: max(52px, env(safe-area-inset-top));
         left: max(8px, env(safe-area-inset-left));
         display: flex;
         flex-wrap: wrap;
@@ -1487,6 +3198,17 @@ def create_interactive_chart(
         background: rgba(16, 18, 21, 0.88);
         box-shadow: 0 4px 18px rgba(0, 0, 0, 0.28);
         backdrop-filter: blur(8px);
+    }
+
+    .toolbar-group {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+    }
+
+    .toolbar-group + .toolbar-group {
+        padding-left: 6px;
+        border-left: 1px solid #3b4652;
     }
 
     .chart-actions button {
@@ -1514,6 +3236,195 @@ def create_interactive_chart(
         transform: translateY(1px);
     }
 
+    .chart-actions button[aria-expanded="true"],
+    .chart-actions .primary-action {
+        border-color: #19c9a5;
+        color: #dffff7;
+        background: #183a35;
+    }
+
+    .indicator-panel {
+        position: absolute;
+        z-index: 30;
+        top: 102px;
+        left: max(8px, env(safe-area-inset-left));
+        width: 282px;
+        max-height: calc(100dvh - 118px);
+        overflow: auto;
+        padding: 12px;
+        border: 1px solid #3d4955;
+        border-radius: 11px;
+        color: #edf3f8;
+        background: rgba(17, 20, 24, 0.96);
+        box-shadow: 0 12px 36px rgba(0, 0, 0, 0.42);
+        backdrop-filter: blur(12px);
+    }
+
+    .indicator-panel[hidden] {
+        display: none;
+    }
+
+    .panel-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 10px;
+    }
+
+    .panel-header h2 {
+        margin: 0;
+        font-size: 14px;
+        letter-spacing: 0.02em;
+    }
+
+    .icon-button {
+        width: 30px;
+        height: 30px;
+        padding: 0;
+        border: 1px solid #4a5663;
+        border-radius: 6px;
+        color: #dbe4ec;
+        background: #252b32;
+        cursor: pointer;
+    }
+
+    .panel-actions {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 6px;
+        margin-bottom: 12px;
+    }
+
+    .panel-hint {
+        margin: -4px 2px 12px;
+        color: #8fa0af;
+        font-size: 10px;
+        line-height: 1.45;
+    }
+
+    .panel-actions button {
+        min-height: 32px;
+        border: 1px solid #485461;
+        border-radius: 6px;
+        color: #e9f0f6;
+        background: #232a31;
+        cursor: pointer;
+    }
+
+    .indicator-panel fieldset {
+        margin: 0 0 12px;
+        padding: 8px;
+        border: 1px solid #303a44;
+        border-radius: 8px;
+    }
+
+    .indicator-panel legend {
+        padding: 0 6px;
+        color: #98a8b7;
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+    }
+
+    .layer-option,
+    .display-option {
+        display: grid;
+        grid-template-columns: auto 1fr auto;
+        align-items: center;
+        gap: 8px;
+        min-height: 34px;
+        padding: 4px 3px;
+        color: #dce5ed;
+        font-size: 12px;
+        cursor: pointer;
+    }
+
+    .display-option {
+        grid-template-columns: 1fr auto;
+    }
+
+    .layer-option + .layer-option,
+    .display-option + .display-option {
+        border-top: 1px solid rgba(67, 79, 91, 0.45);
+    }
+
+    .layer-option input,
+    .display-option input {
+        width: 16px;
+        height: 16px;
+        margin: 0;
+        accent-color: #19c9a5;
+    }
+
+    .layer-swatch {
+        width: 18px;
+        height: 4px;
+        border-radius: 4px;
+        background: var(--swatch, #aab5c0);
+        box-shadow: 0 0 8px color-mix(in srgb, var(--swatch), transparent 45%);
+    }
+
+    .chart-help {
+        width: min(540px, calc(100vw - 24px));
+        padding: 0;
+        border: 1px solid #465360;
+        border-radius: 12px;
+        color: #eaf1f7;
+        background: #15191e;
+        box-shadow: 0 18px 60px rgba(0, 0, 0, 0.58);
+    }
+
+    .chart-help::backdrop {
+        background: rgba(4, 6, 8, 0.72);
+        backdrop-filter: blur(3px);
+    }
+
+    .help-content {
+        padding: 18px;
+    }
+
+    .help-content h2 {
+        margin: 0 0 12px;
+        font-size: 18px;
+    }
+
+    .help-content h3 {
+        margin: 16px 0 6px;
+        color: #8fe8d4;
+        font-size: 12px;
+        text-transform: uppercase;
+    }
+
+    .help-content p,
+    .help-content li {
+        color: #bdc9d4;
+        font-size: 12px;
+        line-height: 1.55;
+    }
+
+    .help-content ul {
+        margin: 6px 0;
+        padding-left: 20px;
+    }
+
+    .help-footer {
+        display: flex;
+        justify-content: flex-end;
+        margin-top: 16px;
+    }
+
+    .help-footer button {
+        min-height: 34px;
+        padding: 6px 14px;
+        border: 1px solid #19c9a5;
+        border-radius: 6px;
+        color: #dffff7;
+        background: #183a35;
+        cursor: pointer;
+    }
+
     .chart-status {
         position: absolute;
         z-index: 18;
@@ -1531,6 +3442,221 @@ def create_interactive_chart(
         backdrop-filter: blur(7px);
     }
 
+    .live-badge {
+        position: absolute;
+        z-index: 21;
+        top: max(10px, env(safe-area-inset-top));
+        left: max(10px, env(safe-area-inset-left));
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        min-height: 28px;
+        padding: 5px 9px;
+        border: 1px solid #3d4955;
+        border-radius: 999px;
+        color: #a9b7c4;
+        background: rgba(16, 18, 21, 0.9);
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+    }
+
+    .live-badge::before {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #7f8b97;
+        content: "";
+    }
+
+    .live-badge[data-state="live"] {
+        border-color: rgba(25, 201, 165, 0.55);
+        color: #9ff3df;
+    }
+
+    .live-badge[data-state="live"]::before {
+        background: #19c9a5;
+        box-shadow: 0 0 9px rgba(25, 201, 165, 0.9);
+    }
+
+    .live-badge[data-state="error"] {
+        border-color: rgba(255, 77, 91, 0.65);
+        color: #ff9aa4;
+    }
+
+    .live-badge[data-state="error"]::before {
+        background: #ff4d5b;
+    }
+
+    .analysis-dashboard {
+        width: min(1440px, 100%);
+        margin: 0 auto;
+        padding: 44px clamp(16px, 4vw, 56px) 64px;
+        color: #e8eef4;
+        background:
+            radial-gradient(circle at 12% 0%, rgba(25, 201, 165, 0.08), transparent 28%),
+            #0d1013;
+    }
+
+    .dashboard-header,
+    .reference-header {
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+        gap: 24px;
+        margin-bottom: 22px;
+    }
+
+    .dashboard-header h2,
+    .reference-header h2 {
+        margin: 2px 0 5px;
+        font-size: clamp(22px, 3vw, 34px);
+    }
+
+    .dashboard-header p,
+    .reference-header p {
+        max-width: 760px;
+        margin: 0;
+        color: #91a0ae;
+        font-size: 12px;
+        line-height: 1.55;
+    }
+
+    .eyebrow {
+        color: #19c9a5 !important;
+        font-size: 10px !important;
+        font-weight: 800;
+        letter-spacing: 0.15em;
+        text-transform: uppercase;
+    }
+
+    .back-to-chart {
+        flex: 0 0 auto;
+        padding: 8px 12px;
+        border: 1px solid #40505d;
+        border-radius: 7px;
+        color: #dbe6ef;
+        text-decoration: none;
+        background: #171c21;
+    }
+
+    .metric-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 12px;
+        margin-bottom: 52px;
+    }
+
+    .metric-card {
+        min-width: 0;
+        padding: 16px;
+        border: 1px solid #27313a;
+        border-radius: 10px;
+        background: linear-gradient(145deg, #151a1f, #11151a);
+        box-shadow: 0 8px 22px rgba(0, 0, 0, 0.18);
+    }
+
+    .metric-card > span {
+        display: block;
+        margin-bottom: 8px;
+        color: #8393a1;
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+    }
+
+    .metric-card strong {
+        display: block;
+        overflow-wrap: anywhere;
+        color: #f0f5f9;
+        font-size: 16px;
+        line-height: 1.35;
+    }
+
+    .metric-card small {
+        display: block;
+        margin-top: 7px;
+        color: #9aa8b5;
+        font-size: 11px;
+        line-height: 1.45;
+    }
+
+    .metric-primary {
+        border-color: rgba(25, 201, 165, 0.45);
+    }
+
+    .metric-primary strong {
+        color: #65e9cb;
+        font-size: 24px;
+    }
+
+    .metric-wide {
+        grid-column: span 2;
+    }
+
+    .reference-header {
+        display: block;
+    }
+
+    .definition-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+    }
+
+    .definition-card {
+        --accent: #8393a1;
+        padding: 18px;
+        border: 1px solid #26313a;
+        border-top: 3px solid var(--accent);
+        border-radius: 9px;
+        background: #12171b;
+    }
+
+    .definition-card h3 {
+        margin: 0 0 12px;
+        color: #f0f4f7;
+        font-size: 15px;
+    }
+
+    .definition-card h3 span {
+        color: var(--accent);
+        font-size: 10px;
+        letter-spacing: 0.08em;
+    }
+
+    .definition-card p {
+        margin: 7px 0 0;
+        color: #a5b2bd;
+        font-size: 12px;
+        line-height: 1.58;
+    }
+
+    .definition-card strong {
+        color: #dce5ec;
+    }
+
+    .fvg-definition { --accent: #00dc79; }
+    .ob-definition { --accent: #5d9cff; }
+    .liquidity-definition { --accent: #d95cff; }
+    .structure-definition { --accent: #00e5ff; }
+    .swing-definition { --accent: #ff6978; }
+    .levels-definition { --accent: #a9b4bf; }
+    .sessions-definition { --accent: #ff9b2d; }
+    .retracement-definition { --accent: #e1e8f0; }
+
+    .analysis-disclaimer {
+        margin: 24px 0 0;
+        padding: 12px 14px;
+        border-left: 3px solid #ffb300;
+        color: #9daab5;
+        background: rgba(255, 179, 0, 0.06);
+        font-size: 11px;
+        line-height: 1.5;
+    }
+
     @media (max-width: 760px) {
         #chart-shell,
         #smc-chart {
@@ -1541,6 +3667,10 @@ def create_interactive_chart(
             gap: 4px;
             padding: 4px;
             max-width: calc(100vw - 78px);
+        }
+
+        .toolbar-group + .toolbar-group {
+            padding-left: 4px;
         }
 
         .chart-actions button {
@@ -1554,6 +3684,31 @@ def create_interactive_chart(
             bottom: 54px;
             padding: 5px 7px;
             font-size: 10px;
+        }
+
+        .metric-grid,
+        .definition-grid {
+            grid-template-columns: 1fr;
+        }
+
+        .metric-wide {
+            grid-column: auto;
+        }
+
+        .dashboard-header {
+            align-items: flex-start;
+            flex-direction: column;
+        }
+
+        .analysis-dashboard {
+            padding-top: 30px;
+        }
+
+        .indicator-panel {
+            top: 148px;
+            left: 8px;
+            width: calc(100vw - 16px);
+            max-height: calc(100dvh - 158px);
         }
 
         .modebar {
@@ -1572,34 +3727,145 @@ def create_interactive_chart(
 
     chart_controls = """
 <main id="chart-shell">
+    <div id="live-badge" class="live-badge" data-state="static">Static snapshot</div>
     <nav class="chart-actions" aria-label="Chart controls">
-        <button id="chart-latest" type="button" title="Show the latest three days (L)">
-            Latest
-        </button>
-        <button id="chart-fit" type="button" title="Fit all loaded candles (R)">
-            Fit
-        </button>
-        <button id="chart-y-in" type="button" title="Zoom in vertically (+)">
-            Y+
-        </button>
-        <button id="chart-y-out" type="button" title="Zoom out vertically (-)">
-            Y−
-        </button>
-        <button id="chart-y-auto" type="button" title="Automatically fit the vertical price scale (0)">
-            Y Auto
-        </button>
-        <button id="chart-fullscreen" type="button" title="Toggle fullscreen (F)" aria-pressed="false">
-            Fullscreen
-        </button>
+        <span class="toolbar-group">
+            <button id="chart-indicators" class="primary-action" type="button" title="Organize indicators (I)" aria-expanded="false" aria-controls="indicator-panel">
+                Indicators
+            </button>
+        </span>
+        <span class="toolbar-group" aria-label="Time range">
+            <button id="chart-1d" type="button" title="Latest day (1)">1D</button>
+            <button id="chart-latest" type="button" title="Latest three days (3 or L)">3D</button>
+            <button id="chart-1w" type="button" title="Latest week (7)">1W</button>
+            <button id="chart-fit" type="button" title="All loaded candles (R)">All</button>
+        </span>
+        <span class="toolbar-group" aria-label="Vertical price scale">
+            <button id="chart-y-in" type="button" title="Zoom in vertically (+)">Y+</button>
+            <button id="chart-y-out" type="button" title="Zoom out vertically (-)">Y-</button>
+            <button id="chart-y-auto" type="button" title="Automatically fit the vertical price scale (0)">Y Auto</button>
+        </span>
+        <span class="toolbar-group">
+            <button id="chart-summary-button" type="button" title="Open summary and indicator guide (S)">Summary</button>
+            <button id="chart-export" type="button" title="Export a PNG image (E)">Export</button>
+            <button id="chart-mplfinance" type="button" title="Open the clean mplfinance chart (P)">MPL View</button>
+            <button id="chart-fullscreen" type="button" title="Toggle fullscreen (F)" aria-pressed="false">Fullscreen</button>
+            <button id="chart-help-button" type="button" title="Chart help and shortcuts (H)">Help</button>
+        </span>
     </nav>
+
+    <aside id="indicator-panel" class="indicator-panel" aria-label="Indicator controls" hidden>
+        <header class="panel-header">
+            <h2>Indicator layers</h2>
+            <button id="close-indicators" class="icon-button" type="button" aria-label="Close indicator panel">×</button>
+        </header>
+
+        <div class="panel-actions">
+            <button id="show-all-layers" type="button">Show all</button>
+            <button id="focus-price" type="button">Price only</button>
+        </div>
+
+        <p class="panel-hint">
+            Checked means enabled. Signals only appear where detected; use All and Y Auto when a layer is outside the current view.
+        </p>
+
+        <fieldset>
+            <legend>Smart Money Concepts</legend>
+            <label class="layer-option">
+                <span class="layer-swatch" style="--swatch:#00dc79"></span>
+                <span>Fair Value Gaps</span>
+                <input type="checkbox" data-layer="fvg" checked>
+            </label>
+            <label class="layer-option">
+                <span class="layer-swatch" style="--swatch:#5d9cff"></span>
+                <span>Order Blocks</span>
+                <input type="checkbox" data-layer="orderblocks" checked>
+            </label>
+            <label class="layer-option">
+                <span class="layer-swatch" style="--swatch:#d95cff"></span>
+                <span>Liquidity &amp; Sweeps</span>
+                <input type="checkbox" data-layer="liquidity" checked>
+            </label>
+            <label class="layer-option">
+                <span class="layer-swatch" style="--swatch:#00e5ff"></span>
+                <span>BOS &amp; CHoCH</span>
+                <input type="checkbox" data-layer="structure" checked>
+            </label>
+            <label class="layer-option">
+                <span class="layer-swatch" style="--swatch:#ff6978"></span>
+                <span>Swing Structure</span>
+                <input type="checkbox" data-layer="swings" checked>
+            </label>
+            <label class="layer-option">
+                <span class="layer-swatch" style="--swatch:#a9b4bf"></span>
+                <span>Previous 4H Levels</span>
+                <input type="checkbox" data-layer="levels" checked>
+            </label>
+            <label class="layer-option">
+                <span class="layer-swatch" style="--swatch:#ff9b2d"></span>
+                <span>Trading Sessions</span>
+                <input type="checkbox" data-layer="sessions" checked>
+            </label>
+            <label class="layer-option">
+                <span class="layer-swatch" style="--swatch:#e1e8f0"></span>
+                <span>Retracement Turns</span>
+                <input type="checkbox" data-layer="retracements" checked>
+            </label>
+        </fieldset>
+
+        <fieldset>
+            <legend>Display</legend>
+            <label class="display-option">
+                <span>Indicator labels</span>
+                <input id="toggle-labels" type="checkbox" checked>
+            </label>
+            <label class="display-option">
+                <span>Grid lines</span>
+                <input id="toggle-grid" type="checkbox" checked>
+            </label>
+            <label class="display-option">
+                <span>Crosshair guides</span>
+                <input id="toggle-crosshair" type="checkbox" checked>
+            </label>
+            <label class="display-option">
+                <span>Range slider</span>
+                <input id="toggle-slider" type="checkbox" checked>
+            </label>
+        </fieldset>
+    </aside>
+
     <aside class="chart-status" aria-live="polite">
         __STATUS_TEXT__
     </aside>
+
+    <dialog id="chart-help" class="chart-help">
+        <div class="help-content">
+            <h2>Chart controls</h2>
+            <p>Drag the chart to move through time. Use the mouse wheel or trackpad to zoom. Hover or tap an indicator for exact values.</p>
+            <h3>Price scale</h3>
+            <ul>
+                <li><strong>Y+</strong> and <strong>Y-</strong> adjust vertical scale.</li>
+                <li><strong>Y Auto</strong> fits visible prices automatically.</li>
+                <li>Drag directly on an axis for manual scaling.</li>
+            </ul>
+            <h3>Keyboard shortcuts</h3>
+            <p>1/3/7: time range · R: all · +/-: vertical zoom · 0: Y Auto · I: indicators · S: summary · E: export · P: mplfinance view · F: fullscreen · H: help</p>
+            <h3>Indicator abbreviations</h3>
+            <p>FVG: Fair Value Gap · OB: Order Block · BSL/SSL: buy-side/sell-side liquidity · PH/PL: previous high/low · C/D: current/deepest retracement.</p>
+            <div class="help-footer">
+                <button id="close-help" type="button">Done</button>
+            </div>
+        </div>
+    </dialog>
 """
 
     chart_controls = chart_controls.replace(
         "__STATUS_TEXT__",
         status_text,
+    )
+
+    dashboard_html = build_analysis_dashboard(
+        data
     )
 
     html = html.replace(
@@ -1615,16 +3881,364 @@ def create_interactive_chart(
 
     html = html.replace(
         "</body>",
-        "</main></body>",
+        f"</main>{dashboard_html}</body>",
         1,
     )
 
-    output_path.write_text(
+    temporary_output_path = output_path.with_suffix(
+        ".tmp"
+    )
+
+    temporary_output_path.write_text(
         html,
         encoding="utf-8",
     )
 
+    try:
+        temporary_output_path.replace(
+            output_path
+        )
+    except PermissionError:
+        output_path.write_text(
+            html,
+            encoding="utf-8",
+        )
+        temporary_output_path.unlink(
+            missing_ok=True
+        )
+
     return output_path
+
+
+# =========================================================
+# LIVE LOCAL DASHBOARD
+# =========================================================
+
+def get_mt5_live_price(
+    fallback_price: float,
+) -> float:
+    """Return the best available live MT5 price."""
+
+    tick = mt5.symbol_info_tick(SYMBOL)
+
+    if tick is None:
+        return float(fallback_price)
+
+    for attribute in ["last", "bid", "ask"]:
+        value = float(
+            getattr(tick, attribute, 0) or 0
+        )
+
+        if value > 0:
+            return value
+
+    return float(fallback_price)
+
+
+def update_live_state(
+    *,
+    last_candle_time=None,
+    last_price=None,
+    error=None,
+    increment_version: bool = False,
+) -> None:
+    """Update state returned to the dashboard polling endpoint."""
+
+    with LIVE_STATE_LOCK:
+        if increment_version:
+            LIVE_STATE["version"] += 1
+
+        if last_candle_time is not None:
+            LIVE_STATE["last_candle_time"] = str(
+                last_candle_time
+            )
+
+        if last_price is not None:
+            LIVE_STATE["last_price"] = float(
+                last_price
+            )
+
+        LIVE_STATE["updated_at"] = (
+            pd.Timestamp.now(tz="UTC").isoformat()
+        )
+        LIVE_STATE["error"] = error
+
+
+def analyze_and_write_outputs(
+    candles: pd.DataFrame,
+) -> tuple[pd.DataFrame, Path, Path]:
+    """Calculate all indicators and atomically refresh outputs."""
+
+    results = calculate_smc_indicators(
+        candles
+    )
+
+    csv_path = Path(
+        CSV_OUTPUT_FILE
+    ).resolve()
+
+    temporary_csv_path = csv_path.with_suffix(
+        ".tmp"
+    )
+
+    results.to_csv(
+        temporary_csv_path,
+        index=False,
+    )
+
+    try:
+        temporary_csv_path.replace(
+            csv_path
+        )
+    except PermissionError:
+        results.to_csv(
+            csv_path,
+            index=False,
+        )
+        temporary_csv_path.unlink(
+            missing_ok=True
+        )
+
+    chart_path = create_interactive_chart(
+        results=results,
+        number_of_candles=CHART_CANDLES,
+    )
+
+    create_mplfinance_snapshot(
+        results=results,
+        number_of_candles=MPLFINANCE_CANDLES,
+    )
+
+    return results, csv_path, chart_path
+
+
+def build_mplfinance_viewer() -> str:
+    """Return a responsive live viewer for the mplfinance snapshot."""
+
+    viewer = """<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>XAUUSD SMC clean chart</title>
+    <style>
+        :root { color-scheme: dark; font-family: Arial, sans-serif; background: #0d1013; }
+        * { box-sizing: border-box; }
+        body { margin: 0; color: #e8eef4; background: #0d1013; }
+        header { position: sticky; z-index: 2; top: 0; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 16px; border-bottom: 1px solid #29333d; background: rgba(13,16,19,.94); backdrop-filter: blur(8px); }
+        h1 { margin: 0; font-size: 16px; }
+        p { margin: 3px 0 0; color: #94a2af; font-size: 11px; }
+        nav { display: flex; flex-wrap: wrap; gap: 7px; }
+        a { padding: 7px 10px; border: 1px solid #465460; border-radius: 6px; color: #e8eef4; background: #1c2329; text-decoration: none; font-size: 12px; }
+        main { padding: 12px; }
+        img { display: block; width: 100%; height: auto; border: 1px solid #28323b; background: #101215; }
+        #status[data-state="live"] { color: #65e9cb; }
+        #status[data-state="error"] { color: #ff8c97; }
+        @media (max-width: 640px) { header { align-items: flex-start; flex-direction: column; } main { padding: 6px; } }
+    </style>
+</head>
+<body>
+    <header>
+        <div>
+            <h1>XAUUSD M15 · mplfinance clean view</h1>
+            <p id="status" data-state="live">Loading latest completed candle…</p>
+        </div>
+        <nav>
+            <a href="/">Interactive dashboard</a>
+            <a href="/mplfinance.png" download="xauusd_m15_smc_snapshot.png">Download PNG</a>
+        </nav>
+    </header>
+    <main>
+        <img id="snapshot" src="/mplfinance.png?v=0" alt="XAUUSD M15 candlestick chart with Smart Money Concepts overlays">
+    </main>
+    <script>
+        const image = document.getElementById("snapshot");
+        const status = document.getElementById("status");
+        let seenVersion = null;
+
+        async function refreshSnapshot() {
+            try {
+                const response = await fetch("/api/status", {cache: "no-store"});
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const live = await response.json();
+                status.dataset.state = live.error ? "error" : "live";
+                status.textContent = live.error
+                    ? `Live warning · ${live.error}`
+                    : `Live · completed candle ${live.last_candle_time || "waiting"}`;
+
+                if (seenVersion === null || live.version !== seenVersion) {
+                    seenVersion = live.version;
+                    image.src = `/mplfinance.png?v=${encodeURIComponent(live.version)}`;
+                }
+            } catch (_) {
+                status.dataset.state = "error";
+                status.textContent = "Live dashboard disconnected";
+            }
+        }
+
+        refreshSnapshot();
+        window.setInterval(refreshSnapshot, __LIVE_REFRESH_MS__);
+    </script>
+</body>
+</html>
+"""
+
+    return viewer.replace(
+        "__LIVE_REFRESH_MS__",
+        str(LIVE_REFRESH_SECONDS * 1000),
+    )
+
+
+class LiveDashboardRequestHandler(
+    BaseHTTPRequestHandler
+):
+    """Serve the chart and its lightweight live status API."""
+
+    def send_bytes(
+        self,
+        status_code: int,
+        content_type: str,
+        payload: bytes,
+    ) -> None:
+        self.send_response(status_code)
+        self.send_header(
+            "Content-Type",
+            content_type,
+        )
+        self.send_header(
+            "Content-Length",
+            str(len(payload)),
+        )
+        self.send_header(
+            "Cache-Control",
+            "no-store, no-cache, must-revalidate",
+        )
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self) -> None:
+        request_path = urlparse(
+            self.path
+        ).path
+
+        if request_path == "/api/status":
+            with LIVE_STATE_LOCK:
+                payload = json.dumps(
+                    LIVE_STATE
+                ).encode("utf-8")
+
+            self.send_bytes(
+                200,
+                "application/json; charset=utf-8",
+                payload,
+            )
+            return
+
+        if request_path in {"/", "/chart"}:
+            chart_path = Path(
+                HTML_OUTPUT_FILE
+            ).resolve()
+
+            if not chart_path.exists():
+                self.send_bytes(
+                    503,
+                    "text/plain; charset=utf-8",
+                    b"Chart is still being generated.",
+                )
+                return
+
+            self.send_bytes(
+                200,
+                "text/html; charset=utf-8",
+                chart_path.read_bytes(),
+            )
+            return
+
+        if request_path == "/mplfinance":
+            self.send_bytes(
+                200,
+                "text/html; charset=utf-8",
+                build_mplfinance_viewer().encode("utf-8"),
+            )
+            return
+
+        if request_path == "/mplfinance.png":
+            snapshot_path = Path(
+                MPLFINANCE_OUTPUT_FILE
+            ).resolve()
+
+            if not snapshot_path.exists():
+                self.send_bytes(
+                    503,
+                    "text/plain; charset=utf-8",
+                    b"The mplfinance chart is still being generated.",
+                )
+                return
+
+            self.send_bytes(
+                200,
+                "image/png",
+                snapshot_path.read_bytes(),
+            )
+            return
+
+        if request_path == "/favicon.ico":
+            self.send_bytes(
+                204,
+                "image/x-icon",
+                b"",
+            )
+            return
+
+        self.send_bytes(
+            404,
+            "text/plain; charset=utf-8",
+            b"Not found",
+        )
+
+    def log_message(
+        self,
+        format_string: str,
+        *args,
+    ) -> None:
+        """Keep routine browser polling out of terminal output."""
+
+
+def start_live_dashboard_server(
+) -> tuple[ThreadingHTTPServer, str]:
+    """Start a localhost server, using the next port if needed."""
+
+    last_error = None
+
+    for port in range(
+        LIVE_PORT,
+        LIVE_PORT + 10,
+    ):
+        try:
+            server = ThreadingHTTPServer(
+                (LIVE_HOST, port),
+                LiveDashboardRequestHandler,
+            )
+            server.daemon_threads = True
+
+            thread = threading.Thread(
+                target=server.serve_forever,
+                name="smc-live-dashboard",
+                daemon=True,
+            )
+            thread.start()
+
+            return (
+                server,
+                f"http://{LIVE_HOST}:{port}/",
+            )
+        except OSError as error:
+            last_error = error
+
+    raise RuntimeError(
+        "Could not start the local dashboard server on "
+        f"ports {LIVE_PORT}-{LIVE_PORT + 9}: {last_error}"
+    )
 
 
 # =========================================================
@@ -1719,7 +4333,6 @@ def print_summary(
 # =========================================================
 
 def main() -> None:
-
     print("Connecting to MetaTrader 5...")
 
     if not mt5.initialize():
@@ -1728,8 +4341,9 @@ def main() -> None:
             f"MetaTrader error: {mt5.last_error()}"
         )
 
-    try:
+    live_server = None
 
+    try:
         print(
             f"Downloading {NUMBER_OF_CANDLES} completed "
             f"{SYMBOL} {TIMEFRAME_NAME} candles..."
@@ -1745,28 +4359,14 @@ def main() -> None:
             f"Downloaded {len(candles)} candles."
         )
 
-        print("Calculating SMC indicators...")
-
-        results = calculate_smc_indicators(
-            candles
-        )
-
-        csv_path = Path(
-            CSV_OUTPUT_FILE
-        ).resolve()
-
-        results.to_csv(
-            csv_path,
-            index=False,
-        )
-
         print(
-            "Creating the clean interactive chart..."
+            "Calculating indicators and creating the dashboard..."
         )
 
-        chart_path = create_interactive_chart(
-            results=results,
-            number_of_candles=CHART_CANDLES,
+        results, csv_path, chart_path = (
+            analyze_and_write_outputs(
+                candles
+            )
         )
 
         print_summary(results)
@@ -1777,21 +4377,149 @@ def main() -> None:
 
         print(f"CSV file:   {csv_path}")
         print(f"Chart file: {chart_path}")
-
-        print("\nOpening chart in your browser...")
-
-        webbrowser.open_new_tab(
-            chart_path.as_uri()
+        print(
+            "MPL chart:  "
+            f"{Path(MPLFINANCE_OUTPUT_FILE).resolve()}"
         )
 
-    except Exception as error:
+        last_candle_time = pd.Timestamp(
+            results["time"].iloc[-1]
+        )
+        fallback_price = float(
+            results["close"].iloc[-1]
+        )
+        live_price = get_mt5_live_price(
+            fallback_price
+        )
 
+        update_live_state(
+            last_candle_time=last_candle_time,
+            last_price=live_price,
+            increment_version=True,
+        )
+
+        if not LIVE_MODE:
+            print("\nOpening static chart in your browser...")
+            webbrowser.open_new_tab(
+                chart_path.as_uri()
+            )
+            return
+
+        live_server, dashboard_url = (
+            start_live_dashboard_server()
+        )
+
+        print("\n========================================")
+        print("LIVE DASHBOARD")
+        print("========================================")
+        print(f"URL: {dashboard_url}")
+        print(
+            f"Checking MT5 every {LIVE_REFRESH_SECONDS} seconds."
+        )
+        print(
+            "The chart recalculates after each completed "
+            f"{TIMEFRAME_NAME} candle. Press Ctrl+C to stop."
+        )
+
+        webbrowser.open_new_tab(
+            dashboard_url
+        )
+
+        last_error_message = None
+
+        while True:
+            time.sleep(
+                LIVE_REFRESH_SECONDS
+            )
+
+            try:
+                recent_candles = get_mt5_candles(
+                    symbol=SYMBOL,
+                    timeframe=TIMEFRAME,
+                    candle_count=2,
+                )
+
+                newest_candle_time = pd.Timestamp(
+                    recent_candles["time"].iloc[-1]
+                )
+
+                live_price = get_mt5_live_price(
+                    fallback_price
+                )
+
+                if newest_candle_time > last_candle_time:
+                    print(
+                        "\nNew completed candle detected: "
+                        f"{newest_candle_time}"
+                    )
+
+                    candles = get_mt5_candles(
+                        symbol=SYMBOL,
+                        timeframe=TIMEFRAME,
+                        candle_count=NUMBER_OF_CANDLES,
+                    )
+
+                    results, csv_path, chart_path = (
+                        analyze_and_write_outputs(
+                            candles
+                        )
+                    )
+
+                    last_candle_time = pd.Timestamp(
+                        results["time"].iloc[-1]
+                    )
+                    fallback_price = float(
+                        results["close"].iloc[-1]
+                    )
+
+                    update_live_state(
+                        last_candle_time=last_candle_time,
+                        last_price=live_price,
+                        increment_version=True,
+                    )
+
+                    print(
+                        "Dashboard refreshed and all SMC "
+                        "indicators recalculated."
+                    )
+                else:
+                    update_live_state(
+                        last_candle_time=last_candle_time,
+                        last_price=live_price,
+                    )
+
+                if last_error_message is not None:
+                    print("MT5 live connection recovered.")
+                    last_error_message = None
+
+            except Exception as live_error:
+                error_message = str(live_error)
+
+                update_live_state(
+                    last_candle_time=last_candle_time,
+                    last_price=live_price,
+                    error=error_message,
+                )
+
+                if error_message != last_error_message:
+                    print(
+                        "\nLive update warning: "
+                        f"{error_message}"
+                    )
+                    last_error_message = error_message
+
+    except KeyboardInterrupt:
+        print("\nLive dashboard stopped by user.")
+
+    except Exception as error:
         print(f"\nError: {error}")
 
     finally:
+        if live_server is not None:
+            live_server.shutdown()
+            live_server.server_close()
 
         mt5.shutdown()
-
         print(
             "\nMetaTrader 5 connection closed."
         )
