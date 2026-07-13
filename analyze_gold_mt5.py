@@ -25,10 +25,18 @@ CHART_CANDLES = 1200
 SWING_LENGTH = 20
 LIQUIDITY_RANGE = 0.01
 
+# MT5 timestamps are Unix timestamps and are treated as UTC.
+SESSION_TIME_ZONE = "UTC"
+SESSION_COLORS = {
+    "London": "rgba(45, 145, 255, 0.07)",
+    "New York": "rgba(255, 155, 45, 0.07)",
+}
+
 # Limit visible active zones to keep the chart clean.
 MAX_FVG_ZONES = 8
 MAX_OB_ZONES = 6
 MAX_LIQUIDITY_LEVELS = 6
+MAX_SWING_MARKERS = 40
 
 CSV_OUTPUT_FILE = "xauusd_m15_smc_results.csv"
 HTML_OUTPUT_FILE = "xauusd_m15_smc_chart.html"
@@ -186,6 +194,28 @@ def calculate_smc_indicators(
         time_frame="1D",
     ).reset_index(drop=True)
 
+    retracements = smc.retracements(
+        data,
+        swings,
+    )
+
+    session_frames = []
+
+    for session_name in SESSION_COLORS:
+        session_prefix = session_name.replace(" ", "")
+
+        session_data = smc.sessions(
+            indexed_data.copy(),
+            session=session_name,
+            time_zone=SESSION_TIME_ZONE,
+        ).reset_index(drop=True)
+
+        session_frames.append(
+            session_data.add_prefix(
+                f"Session_{session_prefix}_"
+            )
+        )
+
     results = pd.concat(
         [
             data.reset_index(drop=True),
@@ -212,6 +242,12 @@ def calculate_smc_indicators(
 
             previous_levels
             .add_prefix("Daily_"),
+
+            retracements
+            .reset_index(drop=True)
+            .add_prefix("Retracement_"),
+
+            *session_frames,
         ],
         axis=1,
     )
@@ -274,6 +310,159 @@ def latest_value(
         return None
 
     return values.iloc[-1]
+
+
+def retracement_status(
+    data: pd.DataFrame,
+) -> str:
+    """Return a compact description of the latest retracement."""
+
+    required_columns = {
+        "Retracement_Direction",
+        "Retracement_CurrentRetracement%",
+        "Retracement_DeepestRetracement%",
+    }
+
+    if not required_columns.issubset(data.columns):
+        return "Retracement unavailable"
+
+    latest = data.iloc[-1]
+
+    direction_value = latest[
+        "Retracement_Direction"
+    ]
+
+    direction = (
+        "Bullish leg"
+        if direction_value == 1
+        else "Bearish leg"
+        if direction_value == -1
+        else "Neutral"
+    )
+
+    current = float(
+        latest[
+            "Retracement_CurrentRetracement%"
+        ]
+    )
+
+    deepest = float(
+        latest[
+            "Retracement_DeepestRetracement%"
+        ]
+    )
+
+    return (
+        f"{direction} · Retracement {current:.1f}% "
+        f"· Deepest {deepest:.1f}%"
+    )
+
+
+def add_session_regions(
+    fig: go.Figure,
+    data: pd.DataFrame,
+    session_name: str,
+    fill_color: str,
+) -> None:
+    """Shade each contiguous active trading session."""
+
+    session_prefix = session_name.replace(" ", "")
+    active_column = f"Session_{session_prefix}_Active"
+
+    if active_column not in data.columns:
+        return
+
+    active = data[active_column].fillna(0).eq(1)
+
+    if not active.any():
+        return
+
+    groups = active.ne(
+        active.shift(fill_value=False)
+    ).cumsum()
+
+    show_legend = True
+
+    for _, session_rows in data[active].groupby(
+        groups[active]
+    ):
+        start_time = session_rows["time"].iloc[0]
+        end_time = (
+            session_rows["time"].iloc[-1]
+            + pd.Timedelta(minutes=TIMEFRAME_MINUTES)
+        )
+
+        fig.add_shape(
+            type="rect",
+            xref="x",
+            yref="paper",
+            x0=start_time,
+            x1=end_time,
+            y0=0,
+            y1=1,
+            fillcolor=fill_color,
+            line={"width": 0},
+            layer="below",
+            name=f"{session_name} Session",
+            legendgroup=f"session_{session_prefix}",
+            showlegend=show_legend,
+        )
+
+        show_legend = False
+
+
+def add_swing_markers(
+    fig: go.Figure,
+    data: pd.DataFrame,
+) -> None:
+    """Draw a limited number of recent swing highs and lows."""
+
+    required_columns = {
+        "Swing_HighLow",
+        "Swing_Level",
+    }
+
+    if not required_columns.issubset(data.columns):
+        return
+
+    swings = data[
+        data["Swing_HighLow"].fillna(0).ne(0)
+        & data["Swing_Level"].notna()
+    ].tail(MAX_SWING_MARKERS)
+
+    definitions = [
+        (1, "Swing High", "#69d7ff", "triangle-down-open"),
+        (-1, "Swing Low", "#ff77d4", "triangle-up-open"),
+    ]
+
+    for direction, label, color, symbol in definitions:
+        selected = swings[
+            swings["Swing_HighLow"] == direction
+        ]
+
+        fig.add_trace(
+            go.Scatter(
+                x=selected["time"],
+                y=selected["Swing_Level"],
+                mode="markers",
+                marker={
+                    "symbol": symbol,
+                    "size": 10,
+                    "color": color,
+                    "line": {
+                        "color": color,
+                        "width": 1.7,
+                    },
+                },
+                name=label,
+                legendgroup="swings",
+                hovertemplate=(
+                    f"<b>{label}</b><br>"
+                    "Level: %{y:.2f}<br>"
+                    "Time: %{x}<extra></extra>"
+                ),
+            )
+        )
 
 
 def select_nearest_active_zones(
@@ -404,6 +593,18 @@ def add_zone_trace(
     if start_time >= end_time:
         return
 
+    short_labels = {
+        "Bullish FVG": "FVG ▲",
+        "Bearish FVG": "FVG ▼",
+        "Bullish Order Block": "OB ▲",
+        "Bearish Order Block": "OB ▼",
+    }
+
+    short_label = short_labels.get(
+        label,
+        label,
+    )
+
     fig.add_trace(
         go.Scatter(
             x=[
@@ -420,12 +621,24 @@ def add_zone_trace(
                 top,
                 bottom,
             ],
-            mode="lines",
+            mode="lines+text",
+            text=[
+                None,
+                None,
+                f"<b>{short_label}</b>",
+                None,
+                None,
+            ],
+            textposition="top left",
+            textfont={
+                "color": border_color,
+                "size": 11,
+            },
             fill="toself",
             fillcolor=fill_color,
             line={
                 "color": border_color,
-                "width": 1.4,
+                "width": 2.1,
             },
             name=label,
             legendgroup=legend_group,
@@ -507,11 +720,11 @@ def add_structure_markers(
                 mode="markers",
                 marker={
                     "symbol": symbol,
-                    "size": 13,
+                    "size": 16,
                     "color": color,
                     "line": {
                         "color": "white",
-                        "width": 1,
+                        "width": 1.5,
                     },
                 },
                 name=label,
@@ -553,6 +766,10 @@ def create_interactive_chart(
         chart_data["close"].iloc[-1]
     )
 
+    status_text = retracement_status(
+        chart_data
+    )
+
     fig = go.Figure()
 
     # -----------------------------------------------------
@@ -574,6 +791,16 @@ def create_interactive_chart(
             whiskerwidth=0.35,
         )
     )
+
+    for session_name, fill_color in (
+        SESSION_COLORS.items()
+    ):
+        add_session_regions(
+            fig=fig,
+            data=chart_data,
+            session_name=session_name,
+            fill_color=fill_color,
+        )
 
     shown_groups = set()
 
@@ -598,12 +825,12 @@ def create_interactive_chart(
         if bullish:
             label = "Bullish FVG"
             group = "bullish_fvg"
-            fill_color = "rgba(0,205,110,0.18)"
+            fill_color = "rgba(0,205,110,0.27)"
             border_color = "rgba(0,240,130,0.95)"
         else:
             label = "Bearish FVG"
             group = "bearish_fvg"
-            fill_color = "rgba(235,55,75,0.18)"
+            fill_color = "rgba(235,55,75,0.27)"
             border_color = "rgba(255,75,95,0.95)"
 
         add_zone_trace(
@@ -645,12 +872,12 @@ def create_interactive_chart(
         if bullish:
             label = "Bullish Order Block"
             group = "bullish_ob"
-            fill_color = "rgba(35,125,255,0.18)"
+            fill_color = "rgba(35,125,255,0.27)"
             border_color = "rgba(65,160,255,0.95)"
         else:
             label = "Bearish Order Block"
             group = "bearish_ob"
-            fill_color = "rgba(255,140,25,0.18)"
+            fill_color = "rgba(255,140,25,0.27)"
             border_color = "rgba(255,175,45,0.95)"
 
         add_zone_trace(
@@ -694,10 +921,12 @@ def create_interactive_chart(
 
         if row["Liquidity_Liquidity"] == 1:
             label = "Buy-side Liquidity"
+            short_label = "BSL"
             group = "buy_side_liquidity"
             line_color = "#d500f9"
         else:
             label = "Sell-side Liquidity"
+            short_label = "SSL"
             group = "sell_side_liquidity"
             line_color = "#ffee00"
 
@@ -711,10 +940,19 @@ def create_interactive_chart(
                     level,
                     level,
                 ],
-                mode="lines",
+                mode="lines+text",
+                text=[
+                    None,
+                    f"<b>{short_label}</b>",
+                ],
+                textposition="top left",
+                textfont={
+                    "color": line_color,
+                    "size": 11,
+                },
                 line={
                     "color": line_color,
-                    "width": 2,
+                    "width": 2.6,
                     "dash": "dot",
                 },
                 name=label,
@@ -729,6 +967,15 @@ def create_interactive_chart(
         )
 
         shown_groups.add(group)
+
+    # -----------------------------------------------------
+    # SWING HIGHS AND LOWS
+    # -----------------------------------------------------
+
+    add_swing_markers(
+        fig=fig,
+        data=chart_data,
+    )
 
     # -----------------------------------------------------
     # BOS MARKERS
@@ -803,12 +1050,19 @@ def create_interactive_chart(
         fig.add_hline(
             y=previous_high,
             line_color="#00e5ff",
-            line_width=2,
+            line_width=2.5,
             line_dash="dash",
             annotation_text=(
                 f"PDH {previous_high:.2f}"
             ),
             annotation_position="top right",
+            annotation_font={
+                "color": "#00e5ff",
+                "size": 12,
+            },
+            annotation_bgcolor="rgba(16,18,21,0.88)",
+            annotation_bordercolor="#00e5ff",
+            annotation_borderpad=4,
         )
 
     if previous_low is not None:
@@ -820,12 +1074,19 @@ def create_interactive_chart(
         fig.add_hline(
             y=previous_low,
             line_color="#ff00e6",
-            line_width=2,
+            line_width=2.5,
             line_dash="dash",
             annotation_text=(
                 f"PDL {previous_low:.2f}"
             ),
             annotation_position="bottom right",
+            annotation_font={
+                "color": "#ff55eb",
+                "size": 12,
+            },
+            annotation_bgcolor="rgba(16,18,21,0.88)",
+            annotation_bordercolor="#ff00e6",
+            annotation_borderpad=4,
         )
 
     # -----------------------------------------------------
@@ -835,12 +1096,19 @@ def create_interactive_chart(
     fig.add_hline(
         y=current_price,
         line_color="white",
-        line_width=1.4,
+        line_width=1.8,
         line_dash="dot",
         annotation_text=(
             f"Price {current_price:.2f}"
         ),
         annotation_position="bottom right",
+        annotation_font={
+            "color": "white",
+            "size": 12,
+        },
+        annotation_bgcolor="rgba(16,18,21,0.92)",
+        annotation_bordercolor="white",
+        annotation_borderpad=4,
     )
 
     # -----------------------------------------------------
@@ -861,10 +1129,12 @@ def create_interactive_chart(
             "xanchor": "center",
         },
         template="plotly_dark",
-        height=1050,
         autosize=True,
         hovermode="closest",
         dragmode="pan",
+        uirevision="smc-responsive-chart",
+        hoverdistance=30,
+        spikedistance=-1,
         paper_bgcolor="#101215",
         plot_bgcolor="#101215",
         xaxis_title="Time",
@@ -956,6 +1226,7 @@ def create_interactive_chart(
     fig.update_yaxes(
         gridcolor="#29313a",
         tickformat=".2f",
+        fixedrange=False,
         showspikes=True,
         spikecolor="#dddddd",
         spikemode="across",
@@ -969,10 +1240,16 @@ def create_interactive_chart(
         "responsive": True,
         "scrollZoom": True,
         "displaylogo": False,
+        "doubleClick": "reset+autosize",
+        "showTips": True,
         "modeBarButtonsToAdd": [
             "drawline",
             "drawrect",
             "eraseshape",
+        ],
+        "modeBarButtonsToRemove": [
+            "select2d",
+            "lasso2d",
         ],
         "toImageButtonOptions": {
             "format": "png",
@@ -983,12 +1260,368 @@ def create_interactive_chart(
         },
     }
 
-    fig.write_html(
-        str(output_path),
+    latest_window_start = max(
+        first_time,
+        last_time - pd.Timedelta(days=3),
+    )
+
+    chart_range_end = (
+        last_time
+        + pd.Timedelta(
+            minutes=TIMEFRAME_MINUTES * 3
+        )
+    )
+
+    responsive_script = """
+(() => {
+    const plot = document.getElementById("smc-chart");
+    const shell = document.getElementById("chart-shell");
+    const latestButton = document.getElementById("chart-latest");
+    const fitButton = document.getElementById("chart-fit");
+    const yZoomInButton = document.getElementById("chart-y-in");
+    const yZoomOutButton = document.getElementById("chart-y-out");
+    const yAutoButton = document.getElementById("chart-y-auto");
+    const fullscreenButton = document.getElementById("chart-fullscreen");
+
+    if (!plot || !shell) return;
+
+    const fullRange = ["__FIRST_TIME__", "__RANGE_END__"];
+    const latestRange = ["__LATEST_START__", "__RANGE_END__"];
+    let compactMode = null;
+    let resizeFrame = null;
+
+    function applyResponsiveLayout() {
+        const isCompact = window.matchMedia("(max-width: 760px)").matches;
+
+        Plotly.Plots.resize(plot);
+
+        if (compactMode === isCompact) return;
+        compactMode = isCompact;
+
+        Plotly.relayout(plot, {
+            margin: isCompact
+                ? {l: 52, r: 72, t: 178, b: 58}
+                : {l: 76, r: 132, t: 142, b: 76},
+            "font.size": isCompact ? 11 : 13,
+            "title.font.size": isCompact ? 15 : 18,
+            "legend.font.size": isCompact ? 9 : 11,
+            "legend.y": isCompact ? 1.03 : 1.02,
+            "xaxis.rangeselector.y": isCompact ? 1.14 : 1.08,
+            "xaxis.title.text": isCompact ? "" : "Time",
+            "yaxis.title.text": isCompact ? "" : "Gold Price"
+        });
+    }
+
+    function scheduleResize() {
+        if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
+        resizeFrame = requestAnimationFrame(() => {
+            resizeFrame = null;
+            applyResponsiveLayout();
+        });
+    }
+
+    function scaleYAxis(factor) {
+        const range = plot?._fullLayout?.yaxis?.range;
+
+        if (!range || range.length !== 2) return;
+
+        const low = Number(range[0]);
+        const high = Number(range[1]);
+
+        if (!Number.isFinite(low) || !Number.isFinite(high)) return;
+
+        const center = (low + high) / 2;
+        const halfRange = Math.max(
+            ((high - low) / 2) * factor,
+            0.01
+        );
+
+        Plotly.relayout(plot, {
+            "yaxis.autorange": false,
+            "yaxis.range": [
+                center - halfRange,
+                center + halfRange
+            ]
+        });
+    }
+
+    latestButton?.addEventListener("click", () => {
+        Plotly.relayout(plot, {
+            "xaxis.range": latestRange,
+            "yaxis.autorange": true
+        });
+    });
+
+    fitButton?.addEventListener("click", () => {
+        Plotly.relayout(plot, {
+            "xaxis.range": fullRange,
+            "yaxis.autorange": true
+        });
+    });
+
+    yZoomInButton?.addEventListener("click", () => {
+        scaleYAxis(0.78);
+    });
+
+    yZoomOutButton?.addEventListener("click", () => {
+        scaleYAxis(1.28);
+    });
+
+    yAutoButton?.addEventListener("click", () => {
+        Plotly.relayout(plot, {
+            "yaxis.autorange": true
+        });
+    });
+
+    fullscreenButton?.addEventListener("click", async () => {
+        if (!document.fullscreenElement) {
+            await shell.requestFullscreen?.();
+        } else {
+            await document.exitFullscreen?.();
+        }
+        scheduleResize();
+    });
+
+    document.addEventListener("fullscreenchange", () => {
+        fullscreenButton?.setAttribute(
+            "aria-pressed",
+            String(Boolean(document.fullscreenElement))
+        );
+        scheduleResize();
+    });
+
+    document.addEventListener("keydown", (event) => {
+        if (event.target instanceof HTMLInputElement) return;
+
+        if (event.key.toLowerCase() === "l") latestButton?.click();
+        if (event.key.toLowerCase() === "r") fitButton?.click();
+        if (event.key.toLowerCase() === "f") fullscreenButton?.click();
+        if (event.key === "+" || event.key === "=") yZoomInButton?.click();
+        if (event.key === "-" || event.key === "_") yZoomOutButton?.click();
+        if (event.key === "0") yAutoButton?.click();
+    });
+
+    window.addEventListener("resize", scheduleResize, {passive: true});
+
+    if ("ResizeObserver" in window) {
+        new ResizeObserver(scheduleResize).observe(shell);
+    }
+
+    applyResponsiveLayout();
+})();
+"""
+
+    responsive_script = (
+        responsive_script
+        .replace(
+            "__FIRST_TIME__",
+            first_time.isoformat(),
+        )
+        .replace(
+            "__LATEST_START__",
+            latest_window_start.isoformat(),
+        )
+        .replace(
+            "__RANGE_END__",
+            chart_range_end.isoformat(),
+        )
+    )
+
+    html = fig.to_html(
         include_plotlyjs=True,
         full_html=True,
-        auto_open=False,
         config=chart_config,
+        div_id="smc-chart",
+        post_script=responsive_script,
+    )
+
+    responsive_styles = """
+<style>
+    :root {
+        color-scheme: dark;
+        font-family: Arial, sans-serif;
+        background: #101215;
+    }
+
+    * {
+        box-sizing: border-box;
+    }
+
+    html,
+    body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+        background: #101215;
+    }
+
+    #chart-shell {
+        position: relative;
+        width: 100%;
+        height: 100vh;
+        height: 100dvh;
+        min-height: 520px;
+        overflow: hidden;
+        background: #101215;
+    }
+
+    #smc-chart {
+        width: 100% !important;
+        height: 100% !important;
+        min-height: 520px;
+    }
+
+    .chart-actions {
+        position: absolute;
+        z-index: 20;
+        top: max(8px, env(safe-area-inset-top));
+        left: max(8px, env(safe-area-inset-left));
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        max-width: min(760px, calc(100vw - 120px));
+        padding: 5px;
+        border: 1px solid #39424d;
+        border-radius: 9px;
+        background: rgba(16, 18, 21, 0.88);
+        box-shadow: 0 4px 18px rgba(0, 0, 0, 0.28);
+        backdrop-filter: blur(8px);
+    }
+
+    .chart-actions button {
+        min-height: 34px;
+        padding: 6px 11px;
+        border: 1px solid #505b68;
+        border-radius: 6px;
+        color: #eef3f8;
+        background: #20262d;
+        font: inherit;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        touch-action: manipulation;
+    }
+
+    .chart-actions button:hover,
+    .chart-actions button:focus-visible {
+        border-color: #19c9a5;
+        background: #29323a;
+        outline: none;
+    }
+
+    .chart-actions button:active {
+        transform: translateY(1px);
+    }
+
+    .chart-status {
+        position: absolute;
+        z-index: 18;
+        right: max(12px, env(safe-area-inset-right));
+        bottom: 64px;
+        max-width: min(440px, calc(100vw - 24px));
+        padding: 7px 10px;
+        border: 1px solid #495563;
+        border-radius: 7px;
+        color: #e8eef5;
+        background: rgba(16, 18, 21, 0.86);
+        box-shadow: 0 3px 14px rgba(0, 0, 0, 0.24);
+        font-size: 12px;
+        pointer-events: none;
+        backdrop-filter: blur(7px);
+    }
+
+    @media (max-width: 760px) {
+        #chart-shell,
+        #smc-chart {
+            min-height: 460px;
+        }
+
+        .chart-actions {
+            gap: 4px;
+            padding: 4px;
+            max-width: calc(100vw - 78px);
+        }
+
+        .chart-actions button {
+            min-height: 38px;
+            padding: 7px 10px;
+            font-size: 11px;
+        }
+
+        .chart-status {
+            right: 8px;
+            bottom: 54px;
+            padding: 5px 7px;
+            font-size: 10px;
+        }
+
+        .modebar {
+            transform: scale(0.9);
+            transform-origin: top right;
+        }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+        .chart-actions button:active {
+            transform: none;
+        }
+    }
+</style>
+"""
+
+    chart_controls = """
+<main id="chart-shell">
+    <nav class="chart-actions" aria-label="Chart controls">
+        <button id="chart-latest" type="button" title="Show the latest three days (L)">
+            Latest
+        </button>
+        <button id="chart-fit" type="button" title="Fit all loaded candles (R)">
+            Fit
+        </button>
+        <button id="chart-y-in" type="button" title="Zoom in vertically (+)">
+            Y+
+        </button>
+        <button id="chart-y-out" type="button" title="Zoom out vertically (-)">
+            Y−
+        </button>
+        <button id="chart-y-auto" type="button" title="Automatically fit the vertical price scale (0)">
+            Y Auto
+        </button>
+        <button id="chart-fullscreen" type="button" title="Toggle fullscreen (F)" aria-pressed="false">
+            Fullscreen
+        </button>
+    </nav>
+    <aside class="chart-status" aria-live="polite">
+        __STATUS_TEXT__
+    </aside>
+"""
+
+    chart_controls = chart_controls.replace(
+        "__STATUS_TEXT__",
+        status_text,
+    )
+
+    html = html.replace(
+        "</head>",
+        f"{responsive_styles}</head>",
+    )
+
+    html = html.replace(
+        "<body>",
+        f"<body>{chart_controls}",
+        1,
+    )
+
+    html = html.replace(
+        "</body>",
+        "</main></body>",
+        1,
+    )
+
+    output_path.write_text(
+        html,
+        encoding="utf-8",
     )
 
     return output_path
