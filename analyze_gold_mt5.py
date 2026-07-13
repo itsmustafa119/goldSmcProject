@@ -16,22 +16,19 @@ TIMEFRAME = mt5.TIMEFRAME_M15
 TIMEFRAME_NAME = "M15"
 TIMEFRAME_MINUTES = 15
 
-# More history downloaded from MetaTrader 5
+# Historical candles downloaded from MetaTrader 5.
 NUMBER_OF_CANDLES = 5000
 
-# Number of candles initially displayed on the chart
-CHART_CANDLES = 1000
+# Candles initially displayed on the chart.
+CHART_CANDLES = 1200
 
 SWING_LENGTH = 20
 LIQUIDITY_RANGE = 0.01
 
-# Maximum number of zones added to the chart
-MAX_FVG_ZONES = 80
-MAX_OB_ZONES = 50
-MAX_LIQUIDITY_LEVELS = 30
-
-# Keep True to show both active and already mitigated zones
-SHOW_MITIGATED_ZONES = True
+# Limit visible active zones to keep the chart clean.
+MAX_FVG_ZONES = 8
+MAX_OB_ZONES = 6
+MAX_LIQUIDITY_LEVELS = 6
 
 CSV_OUTPUT_FILE = "xauusd_m15_smc_results.csv"
 HTML_OUTPUT_FILE = "xauusd_m15_smc_chart.html"
@@ -50,15 +47,15 @@ def find_gold_symbols() -> list[str]:
         return []
 
     return [
-        symbol.name
-        for symbol in symbols
-        if "XAU" in symbol.name.upper()
-        or "GOLD" in symbol.name.upper()
+        item.name
+        for item in symbols
+        if "XAU" in item.name.upper()
+        or "GOLD" in item.name.upper()
     ]
 
 
 # =========================================================
-# DOWNLOAD CANDLES
+# DOWNLOAD MT5 DATA
 # =========================================================
 
 def get_mt5_candles(
@@ -71,11 +68,9 @@ def get_mt5_candles(
     symbol_info = mt5.symbol_info(symbol)
 
     if symbol_info is None:
-        possible_symbols = find_gold_symbols()
-
         raise ValueError(
             f"Symbol '{symbol}' was not found.\n"
-            f"Possible gold symbols: {possible_symbols}"
+            f"Possible gold symbols: {find_gold_symbols()}"
         )
 
     if not symbol_info.visible:
@@ -84,8 +79,7 @@ def get_mt5_candles(
                 f"Could not enable {symbol} in Market Watch."
             )
 
-    # Candle 0 is still forming.
-    # Start from candle 1 to use only completed candles.
+    # Candle 0 is unfinished, so start from candle 1.
     rates = mt5.copy_rates_from_pos(
         symbol,
         timeframe,
@@ -95,7 +89,7 @@ def get_mt5_candles(
 
     if rates is None or len(rates) == 0:
         raise RuntimeError(
-            f"No candle data was received for {symbol}.\n"
+            f"No candle data received for {symbol}.\n"
             f"MetaTrader error: {mt5.last_error()}"
         )
 
@@ -132,12 +126,11 @@ def get_mt5_candles(
             f"Missing candle columns: {missing_columns}"
         )
 
-    data = data[required_columns].copy()
-
-    data = data.sort_values("time")
-    data = data.reset_index(drop=True)
-
-    return data
+    return (
+        data[required_columns]
+        .sort_values("time")
+        .reset_index(drop=True)
+    )
 
 
 # =========================================================
@@ -177,7 +170,7 @@ def calculate_smc_indicators(
         close_mitigation=False,
     )
 
-    # previous_high_low requires datetime as the index.
+    # previous_high_low requires time as the index.
     indexed_data = data.set_index("time")[
         [
             "open",
@@ -186,16 +179,12 @@ def calculate_smc_indicators(
             "close",
             "volume",
         ]
-    ].copy()
+    ]
 
     previous_levels = smc.previous_high_low(
         indexed_data,
         time_frame="1D",
-    )
-
-    previous_levels = previous_levels.reset_index(
-        drop=True
-    )
+    ).reset_index(drop=True)
 
     results = pd.concat(
         [
@@ -222,7 +211,6 @@ def calculate_smc_indicators(
             .add_prefix("OB_"),
 
             previous_levels
-            .reset_index(drop=True)
             .add_prefix("Daily_"),
         ],
         axis=1,
@@ -235,29 +223,35 @@ def calculate_smc_indicators(
 # HELPER FUNCTIONS
 # =========================================================
 
-def is_valid_indicator_index(value) -> bool:
-    """Check whether an indicator index points to a real candle."""
+def indicator_is_active(value) -> bool:
+    """
+    NaN or zero means the zone has not yet been
+    mitigated or swept.
+    """
 
     if pd.isna(value):
-        return False
+        return True
 
     try:
-        return int(value) > 0
+        return int(value) <= 0
     except (TypeError, ValueError):
-        return False
+        return True
 
 
-def indicator_index_to_time(
+def get_index_time(
     data: pd.DataFrame,
     index_value,
     default_time,
 ):
-    """Convert an indicator candle index into candle time."""
+    """Convert an indicator candle index to candle time."""
 
-    if not is_valid_indicator_index(index_value):
+    if pd.isna(index_value):
         return default_time
 
-    candle_index = int(index_value)
+    try:
+        candle_index = int(index_value)
+    except (TypeError, ValueError):
+        return default_time
 
     if 0 <= candle_index < len(data):
         return data.iloc[candle_index]["time"]
@@ -265,29 +259,7 @@ def indicator_index_to_time(
     return default_time
 
 
-def get_zone_end_time(
-    data: pd.DataFrame,
-    index_value,
-    latest_time,
-):
-    """
-    Return mitigation/sweep time.
-
-    A value of zero or NaN means that the zone remains active.
-    """
-
-    if not is_valid_indicator_index(index_value):
-        return latest_time
-
-    candle_index = int(index_value)
-
-    if 0 <= candle_index < len(data):
-        return data.iloc[candle_index]["time"]
-
-    return latest_time
-
-
-def get_latest_nonempty_value(
+def latest_value(
     data: pd.DataFrame,
     column: str,
 ):
@@ -304,113 +276,247 @@ def get_latest_nonempty_value(
     return values.iloc[-1]
 
 
-def add_zone_to_chart(
+def select_nearest_active_zones(
+    data: pd.DataFrame,
+    signal_column: str,
+    top_column: str,
+    bottom_column: str,
+    mitigation_column: str,
+    current_price: float,
+    maximum_zones: int,
+) -> pd.DataFrame:
+    """Select active zones closest to current price."""
+
+    required_columns = {
+        signal_column,
+        top_column,
+        bottom_column,
+    }
+
+    if not required_columns.issubset(data.columns):
+        return pd.DataFrame()
+
+    zones = data[
+        data[signal_column].fillna(0).ne(0)
+        & data[top_column].notna()
+        & data[bottom_column].notna()
+    ].copy()
+
+    if zones.empty:
+        return zones
+
+    if mitigation_column in zones.columns:
+        zones = zones[
+            zones[mitigation_column].apply(
+                indicator_is_active
+            )
+        ].copy()
+
+    if zones.empty:
+        return zones
+
+    zones["_middle"] = (
+        zones[top_column].astype(float)
+        + zones[bottom_column].astype(float)
+    ) / 2
+
+    zones["_distance"] = (
+        zones["_middle"] - current_price
+    ).abs()
+
+    return (
+        zones
+        .nsmallest(maximum_zones, "_distance")
+        .sort_index()
+    )
+
+
+def select_nearest_active_liquidity(
+    data: pd.DataFrame,
+    current_price: float,
+    maximum_levels: int,
+) -> pd.DataFrame:
+    """Select active liquidity levels nearest to price."""
+
+    required_columns = {
+        "Liquidity_Liquidity",
+        "Liquidity_Level",
+    }
+
+    if not required_columns.issubset(data.columns):
+        return pd.DataFrame()
+
+    levels = data[
+        data["Liquidity_Liquidity"].fillna(0).ne(0)
+        & data["Liquidity_Level"].notna()
+    ].copy()
+
+    if levels.empty:
+        return levels
+
+    if "Liquidity_Swept" in levels.columns:
+        levels = levels[
+            levels["Liquidity_Swept"].apply(
+                indicator_is_active
+            )
+        ].copy()
+
+    if levels.empty:
+        return levels
+
+    levels["_distance"] = (
+        levels["Liquidity_Level"].astype(float)
+        - current_price
+    ).abs()
+
+    return (
+        levels
+        .nsmallest(maximum_levels, "_distance")
+        .sort_index()
+    )
+
+
+def add_zone_trace(
     fig: go.Figure,
     start_time,
     end_time,
     bottom: float,
     top: float,
     label: str,
+    legend_group: str,
     fill_color: str,
     border_color: str,
+    show_legend: bool,
 ) -> None:
-    """Add a labelled rectangular zone."""
+    """
+    Draw a zone without permanent text.
 
-    if pd.isna(bottom) or pd.isna(top):
-        return
+    Zone information appears when the mouse is placed
+    over the rectangle.
+    """
 
     bottom = float(bottom)
     top = float(top)
 
-    if end_time <= start_time:
-        return
-
     if top < bottom:
         top, bottom = bottom, top
 
-    fig.add_shape(
-        type="rect",
-        x0=start_time,
-        x1=end_time,
-        y0=bottom,
-        y1=top,
-        fillcolor=fill_color,
-        line={
-            "color": border_color,
-            "width": 1.5,
-        },
-        layer="below",
+    if start_time >= end_time:
+        return
+
+    fig.add_trace(
+        go.Scatter(
+            x=[
+                start_time,
+                end_time,
+                end_time,
+                start_time,
+                start_time,
+            ],
+            y=[
+                bottom,
+                bottom,
+                top,
+                top,
+                bottom,
+            ],
+            mode="lines",
+            fill="toself",
+            fillcolor=fill_color,
+            line={
+                "color": border_color,
+                "width": 1.4,
+            },
+            name=label,
+            legendgroup=legend_group,
+            showlegend=show_legend,
+            hoveron="fills",
+            hovertemplate=(
+                f"<b>{label}</b><br>"
+                f"Top: {top:.2f}<br>"
+                f"Bottom: {bottom:.2f}<br>"
+                f"Size: {top - bottom:.2f}<br>"
+                f"Created: {start_time}<br>"
+                "<extra></extra>"
+            ),
+        )
     )
 
-    middle_time = (
-        start_time
-        + (end_time - start_time) / 2
-    )
 
-    middle_price = (top + bottom) / 2
-
-    fig.add_annotation(
-        x=middle_time,
-        y=middle_price,
-        text=f"<b>{label}</b>",
-        showarrow=False,
-        font={
-            "size": 11,
-            "color": "white",
-        },
-        bgcolor="rgba(15, 15, 15, 0.75)",
-        bordercolor=border_color,
-        borderwidth=1,
-        borderpad=3,
-        opacity=0.95,
-    )
-
-
-def add_legend_guides(
+def add_structure_markers(
     fig: go.Figure,
+    data: pd.DataFrame,
+    first_time,
+    signal_column: str,
+    definitions,
 ) -> None:
-    """Add clear legend entries for chart zones."""
+    """Add BOS or CHoCH markers without permanent text."""
 
-    legend_items = [
-        (
-            "Bullish FVG",
-            "rgba(0, 210, 110, 0.65)",
-            "rgba(0, 230, 120, 1)",
-        ),
-        (
-            "Bearish FVG",
-            "rgba(230, 50, 70, 0.65)",
-            "rgba(255, 70, 90, 1)",
-        ),
-        (
-            "Bullish Order Block",
-            "rgba(30, 130, 255, 0.65)",
-            "rgba(60, 160, 255, 1)",
-        ),
-        (
-            "Bearish Order Block",
-            "rgba(255, 140, 20, 0.65)",
-            "rgba(255, 170, 40, 1)",
-        ),
+    required_columns = {
+        signal_column,
+        "Structure_Level",
+        "Structure_BrokenIndex",
+    }
+
+    if not required_columns.issubset(data.columns):
+        return
+
+    rows = data[
+        data[signal_column].fillna(0).ne(0)
+        & data["Structure_Level"].notna()
     ]
 
-    for name, fill_color, border_color in legend_items:
+    for direction, label, color, symbol in definitions:
+
+        selected = rows[
+            rows[signal_column] == direction
+        ]
+
+        signal_times = []
+        signal_levels = []
+        hover_text = []
+
+        for _, row in selected.iterrows():
+
+            signal_time = get_index_time(
+                data,
+                row["Structure_BrokenIndex"],
+                row["time"],
+            )
+
+            if signal_time < first_time:
+                continue
+
+            level = float(
+                row["Structure_Level"]
+            )
+
+            signal_times.append(signal_time)
+            signal_levels.append(level)
+
+            hover_text.append(
+                f"<b>{label}</b><br>"
+                f"Level: {level:.2f}<br>"
+                f"Time: {signal_time}"
+            )
+
         fig.add_trace(
             go.Scatter(
-                x=[None],
-                y=[None],
+                x=signal_times,
+                y=signal_levels,
                 mode="markers",
                 marker={
-                    "symbol": "square",
-                    "size": 15,
-                    "color": fill_color,
+                    "symbol": symbol,
+                    "size": 13,
+                    "color": color,
                     "line": {
-                        "color": border_color,
-                        "width": 1.5,
+                        "color": "white",
+                        "width": 1,
                     },
                 },
-                name=name,
-                hoverinfo="skip",
+                name=label,
+                hovertext=hover_text,
+                hoverinfo="text",
             )
         )
 
@@ -421,9 +527,9 @@ def add_legend_guides(
 
 def create_interactive_chart(
     results: pd.DataFrame,
-    number_of_candles: int,
+    number_of_candles: int = 1200,
 ) -> Path:
-    """Create an interactive and user-friendly chart."""
+    """Create a clean interactive SMC chart."""
 
     data = results.copy()
 
@@ -437,16 +543,20 @@ def create_interactive_chart(
 
     if chart_data.empty:
         raise ValueError(
-            "No candle data is available for the chart."
+            "No candles are available for the chart."
         )
 
     first_time = chart_data["time"].iloc[0]
     last_time = chart_data["time"].iloc[-1]
 
+    current_price = float(
+        chart_data["close"].iloc[-1]
+    )
+
     fig = go.Figure()
 
     # -----------------------------------------------------
-    # Candlesticks
+    # CANDLESTICKS
     # -----------------------------------------------------
 
     fig.add_trace(
@@ -457,633 +567,302 @@ def create_interactive_chart(
             low=chart_data["low"],
             close=chart_data["close"],
             name=f"{SYMBOL} {TIMEFRAME_NAME}",
-            increasing_line_color="#16c7a3",
-            increasing_fillcolor="#16c7a3",
-            decreasing_line_color="#ff4d5a",
-            decreasing_fillcolor="#ff4d5a",
-            whiskerwidth=0.4,
-            hovertext=[
-                (
-                    f"Time: {row.time}<br>"
-                    f"Open: {row.open:.2f}<br>"
-                    f"High: {row.high:.2f}<br>"
-                    f"Low: {row.low:.2f}<br>"
-                    f"Close: {row.close:.2f}"
-                )
-                for row in chart_data.itertuples()
-            ],
-            hoverinfo="text",
+            increasing_line_color="#19c9a5",
+            increasing_fillcolor="#19c9a5",
+            decreasing_line_color="#ff4d5b",
+            decreasing_fillcolor="#ff4d5b",
+            whiskerwidth=0.35,
         )
     )
 
-    add_legend_guides(fig)
+    shown_groups = set()
 
     # -----------------------------------------------------
-    # BOS
+    # ACTIVE FAIR VALUE GAPS
     # -----------------------------------------------------
 
-    required_bos_columns = {
-        "Structure_BOS",
-        "Structure_Level",
-        "Structure_BrokenIndex",
-    }
+    fvg_zones = select_nearest_active_zones(
+        data=data,
+        signal_column="FVG_FVG",
+        top_column="FVG_Top",
+        bottom_column="FVG_Bottom",
+        mitigation_column="FVG_MitigatedIndex",
+        current_price=current_price,
+        maximum_zones=MAX_FVG_ZONES,
+    )
 
-    if required_bos_columns.issubset(data.columns):
-        bos_rows = data[
-            data["Structure_BOS"].fillna(0).ne(0)
-            & data["Structure_Level"].notna()
-        ].copy()
+    for _, row in fvg_zones.iterrows():
 
-        bullish_times = []
-        bullish_levels = []
-        bullish_hover = []
+        bullish = row["FVG_FVG"] == 1
 
-        bearish_times = []
-        bearish_levels = []
-        bearish_hover = []
+        if bullish:
+            label = "Bullish FVG"
+            group = "bullish_fvg"
+            fill_color = "rgba(0,205,110,0.18)"
+            border_color = "rgba(0,240,130,0.95)"
+        else:
+            label = "Bearish FVG"
+            group = "bearish_fvg"
+            fill_color = "rgba(235,55,75,0.18)"
+            border_color = "rgba(255,75,95,0.95)"
 
-        for _, row in bos_rows.iterrows():
-            signal_time = indicator_index_to_time(
-                data,
-                row["Structure_BrokenIndex"],
+        add_zone_trace(
+            fig=fig,
+            start_time=max(
                 row["time"],
-            )
-
-            if signal_time < first_time:
-                continue
-
-            level = float(row["Structure_Level"])
-
-            if row["Structure_BOS"] == 1:
-                bullish_times.append(signal_time)
-                bullish_levels.append(level)
-                bullish_hover.append(
-                    f"Bullish BOS<br>"
-                    f"Level: {level:.2f}<br>"
-                    f"Time: {signal_time}"
-                )
-
-            elif row["Structure_BOS"] == -1:
-                bearish_times.append(signal_time)
-                bearish_levels.append(level)
-                bearish_hover.append(
-                    f"Bearish BOS<br>"
-                    f"Level: {level:.2f}<br>"
-                    f"Time: {signal_time}"
-                )
-
-        fig.add_trace(
-            go.Scatter(
-                x=bullish_times,
-                y=bullish_levels,
-                mode="markers+text",
-                marker={
-                    "symbol": "triangle-up",
-                    "size": 17,
-                    "color": "#00e676",
-                    "line": {
-                        "color": "white",
-                        "width": 1,
-                    },
-                },
-                text=["Bullish BOS"] * len(bullish_times),
-                textposition="bottom center",
-                textfont={
-                    "size": 11,
-                    "color": "#00e676",
-                },
-                hovertext=bullish_hover,
-                hoverinfo="text",
-                name="Bullish BOS",
-            )
+                first_time,
+            ),
+            end_time=last_time,
+            bottom=row["FVG_Bottom"],
+            top=row["FVG_Top"],
+            label=label,
+            legend_group=group,
+            fill_color=fill_color,
+            border_color=border_color,
+            show_legend=group not in shown_groups,
         )
 
-        fig.add_trace(
-            go.Scatter(
-                x=bearish_times,
-                y=bearish_levels,
-                mode="markers+text",
-                marker={
-                    "symbol": "triangle-down",
-                    "size": 17,
-                    "color": "#ff1744",
-                    "line": {
-                        "color": "white",
-                        "width": 1,
-                    },
-                },
-                text=["Bearish BOS"] * len(bearish_times),
-                textposition="top center",
-                textfont={
-                    "size": 11,
-                    "color": "#ff5252",
-                },
-                hovertext=bearish_hover,
-                hoverinfo="text",
-                name="Bearish BOS",
-            )
-        )
+        shown_groups.add(group)
 
     # -----------------------------------------------------
-    # CHoCH
+    # ACTIVE ORDER BLOCKS
     # -----------------------------------------------------
 
-    required_choch_columns = {
-        "Structure_CHOCH",
-        "Structure_Level",
-        "Structure_BrokenIndex",
-    }
+    order_block_zones = select_nearest_active_zones(
+        data=data,
+        signal_column="OB_OB",
+        top_column="OB_Top",
+        bottom_column="OB_Bottom",
+        mitigation_column="OB_MitigatedIndex",
+        current_price=current_price,
+        maximum_zones=MAX_OB_ZONES,
+    )
 
-    if required_choch_columns.issubset(data.columns):
-        choch_rows = data[
-            data["Structure_CHOCH"].fillna(0).ne(0)
-            & data["Structure_Level"].notna()
-        ].copy()
+    for _, row in order_block_zones.iterrows():
 
-        bullish_times = []
-        bullish_levels = []
-        bullish_hover = []
+        bullish = row["OB_OB"] == 1
 
-        bearish_times = []
-        bearish_levels = []
-        bearish_hover = []
+        if bullish:
+            label = "Bullish Order Block"
+            group = "bullish_ob"
+            fill_color = "rgba(35,125,255,0.18)"
+            border_color = "rgba(65,160,255,0.95)"
+        else:
+            label = "Bearish Order Block"
+            group = "bearish_ob"
+            fill_color = "rgba(255,140,25,0.18)"
+            border_color = "rgba(255,175,45,0.95)"
 
-        for _, row in choch_rows.iterrows():
-            signal_time = indicator_index_to_time(
-                data,
-                row["Structure_BrokenIndex"],
+        add_zone_trace(
+            fig=fig,
+            start_time=max(
                 row["time"],
-            )
+                first_time,
+            ),
+            end_time=last_time,
+            bottom=row["OB_Bottom"],
+            top=row["OB_Top"],
+            label=label,
+            legend_group=group,
+            fill_color=fill_color,
+            border_color=border_color,
+            show_legend=group not in shown_groups,
+        )
 
-            if signal_time < first_time:
-                continue
+        shown_groups.add(group)
 
-            level = float(row["Structure_Level"])
+    # -----------------------------------------------------
+    # ACTIVE LIQUIDITY
+    # -----------------------------------------------------
 
-            if row["Structure_CHOCH"] == 1:
-                bullish_times.append(signal_time)
-                bullish_levels.append(level)
-                bullish_hover.append(
-                    f"Bullish CHoCH<br>"
-                    f"Level: {level:.2f}<br>"
-                    f"Time: {signal_time}"
-                )
+    liquidity_rows = select_nearest_active_liquidity(
+        data=data,
+        current_price=current_price,
+        maximum_levels=MAX_LIQUIDITY_LEVELS,
+    )
 
-            elif row["Structure_CHOCH"] == -1:
-                bearish_times.append(signal_time)
-                bearish_levels.append(level)
-                bearish_hover.append(
-                    f"Bearish CHoCH<br>"
-                    f"Level: {level:.2f}<br>"
-                    f"Time: {signal_time}"
-                )
+    for _, row in liquidity_rows.iterrows():
+
+        level = float(
+            row["Liquidity_Level"]
+        )
+
+        start_time = max(
+            row["time"],
+            first_time,
+        )
+
+        if row["Liquidity_Liquidity"] == 1:
+            label = "Buy-side Liquidity"
+            group = "buy_side_liquidity"
+            line_color = "#d500f9"
+        else:
+            label = "Sell-side Liquidity"
+            group = "sell_side_liquidity"
+            line_color = "#ffee00"
 
         fig.add_trace(
             go.Scatter(
-                x=bullish_times,
-                y=bullish_levels,
-                mode="markers+text",
-                marker={
-                    "symbol": "diamond",
-                    "size": 16,
-                    "color": "#00e5ff",
-                    "line": {
-                        "color": "white",
-                        "width": 1,
-                    },
-                },
-                text=["Bullish CHoCH"] * len(bullish_times),
-                textposition="bottom center",
-                textfont={
-                    "size": 11,
-                    "color": "#00e5ff",
-                },
-                hovertext=bullish_hover,
-                hoverinfo="text",
-                name="Bullish CHoCH",
-            )
-        )
-
-        fig.add_trace(
-            go.Scatter(
-                x=bearish_times,
-                y=bearish_levels,
-                mode="markers+text",
-                marker={
-                    "symbol": "diamond",
-                    "size": 16,
-                    "color": "#ffb300",
-                    "line": {
-                        "color": "white",
-                        "width": 1,
-                    },
-                },
-                text=["Bearish CHoCH"] * len(bearish_times),
-                textposition="top center",
-                textfont={
-                    "size": 11,
-                    "color": "#ffca28",
-                },
-                hovertext=bearish_hover,
-                hoverinfo="text",
-                name="Bearish CHoCH",
-            )
-        )
-
-    # -----------------------------------------------------
-    # FAIR VALUE GAPS
-    # -----------------------------------------------------
-
-    required_fvg_columns = {
-        "FVG_FVG",
-        "FVG_Top",
-        "FVG_Bottom",
-    }
-
-    if required_fvg_columns.issubset(data.columns):
-        fvg_rows = data[
-            data["FVG_FVG"].notna()
-            & data["FVG_Top"].notna()
-            & data["FVG_Bottom"].notna()
-        ].tail(MAX_FVG_ZONES)
-
-        for _, row in fvg_rows.iterrows():
-            mitigation_index = row.get(
-                "FVG_MitigatedIndex"
-            )
-
-            is_active = not is_valid_indicator_index(
-                mitigation_index
-            )
-
-            if not SHOW_MITIGATED_ZONES and not is_active:
-                continue
-
-            zone_start = row["time"]
-
-            zone_end = get_zone_end_time(
-                data,
-                mitigation_index,
-                last_time,
-            )
-
-            if zone_end < first_time:
-                continue
-
-            if zone_start > last_time:
-                continue
-
-            if zone_start < first_time:
-                zone_start = first_time
-
-            if zone_end > last_time:
-                zone_end = last_time
-
-            bullish = row["FVG_FVG"] == 1
-
-            if bullish:
-                label = (
-                    "Bullish FVG — Active"
-                    if is_active
-                    else "Bullish FVG"
-                )
-
-                fill_color = (
-                    "rgba(0, 210, 110, 0.28)"
-                    if is_active
-                    else "rgba(0, 210, 110, 0.13)"
-                )
-
-                border_color = (
-                    "rgba(0, 240, 125, 0.95)"
-                )
-
-            else:
-                label = (
-                    "Bearish FVG — Active"
-                    if is_active
-                    else "Bearish FVG"
-                )
-
-                fill_color = (
-                    "rgba(235, 45, 65, 0.28)"
-                    if is_active
-                    else "rgba(235, 45, 65, 0.13)"
-                )
-
-                border_color = (
-                    "rgba(255, 70, 90, 0.95)"
-                )
-
-            add_zone_to_chart(
-                fig=fig,
-                start_time=zone_start,
-                end_time=zone_end,
-                bottom=row["FVG_Bottom"],
-                top=row["FVG_Top"],
-                label=label,
-                fill_color=fill_color,
-                border_color=border_color,
-            )
-
-    # -----------------------------------------------------
-    # ORDER BLOCKS
-    # -----------------------------------------------------
-
-    required_ob_columns = {
-        "OB_OB",
-        "OB_Top",
-        "OB_Bottom",
-    }
-
-    if required_ob_columns.issubset(data.columns):
-        order_block_rows = data[
-            data["OB_OB"].notna()
-            & data["OB_Top"].notna()
-            & data["OB_Bottom"].notna()
-        ].tail(MAX_OB_ZONES)
-
-        for _, row in order_block_rows.iterrows():
-            mitigation_index = row.get(
-                "OB_MitigatedIndex"
-            )
-
-            is_active = not is_valid_indicator_index(
-                mitigation_index
-            )
-
-            if not SHOW_MITIGATED_ZONES and not is_active:
-                continue
-
-            zone_start = row["time"]
-
-            zone_end = get_zone_end_time(
-                data,
-                mitigation_index,
-                last_time,
-            )
-
-            if zone_end < first_time:
-                continue
-
-            if zone_start > last_time:
-                continue
-
-            if zone_start < first_time:
-                zone_start = first_time
-
-            if zone_end > last_time:
-                zone_end = last_time
-
-            bullish = row["OB_OB"] == 1
-
-            if bullish:
-                label = (
-                    "Bullish OB — Active"
-                    if is_active
-                    else "Bullish OB"
-                )
-
-                fill_color = (
-                    "rgba(30, 125, 255, 0.27)"
-                    if is_active
-                    else "rgba(30, 125, 255, 0.12)"
-                )
-
-                border_color = (
-                    "rgba(65, 155, 255, 0.95)"
-                )
-
-            else:
-                label = (
-                    "Bearish OB — Active"
-                    if is_active
-                    else "Bearish OB"
-                )
-
-                fill_color = (
-                    "rgba(255, 135, 20, 0.27)"
-                    if is_active
-                    else "rgba(255, 135, 20, 0.12)"
-                )
-
-                border_color = (
-                    "rgba(255, 170, 45, 0.95)"
-                )
-
-            add_zone_to_chart(
-                fig=fig,
-                start_time=zone_start,
-                end_time=zone_end,
-                bottom=row["OB_Bottom"],
-                top=row["OB_Top"],
-                label=label,
-                fill_color=fill_color,
-                border_color=border_color,
-            )
-
-    # -----------------------------------------------------
-    # LIQUIDITY LEVELS
-    # -----------------------------------------------------
-
-    required_liquidity_columns = {
-        "Liquidity_Liquidity",
-        "Liquidity_Level",
-    }
-
-    if required_liquidity_columns.issubset(data.columns):
-        liquidity_rows = data[
-            data["Liquidity_Liquidity"].notna()
-            & data["Liquidity_Level"].notna()
-        ].tail(MAX_LIQUIDITY_LEVELS)
-
-        for _, row in liquidity_rows.iterrows():
-            level_start = row["time"]
-
-            swept_index = row.get(
-                "Liquidity_Swept"
-            )
-
-            is_active = not is_valid_indicator_index(
-                swept_index
-            )
-
-            level_end = get_zone_end_time(
-                data,
-                swept_index,
-                last_time,
-            )
-
-            if level_end < first_time:
-                continue
-
-            if level_start > last_time:
-                continue
-
-            if level_start < first_time:
-                level_start = first_time
-
-            if level_end > last_time:
-                level_end = last_time
-
-            level = float(
-                row["Liquidity_Level"]
-            )
-
-            if row["Liquidity_Liquidity"] == 1:
-                line_color = "#d500f9"
-                label = (
-                    "High Liquidity — Active"
-                    if is_active
-                    else "High Liquidity"
-                )
-            else:
-                line_color = "#ffea00"
-                label = (
-                    "Low Liquidity — Active"
-                    if is_active
-                    else "Low Liquidity"
-                )
-
-            fig.add_shape(
-                type="line",
-                x0=level_start,
-                x1=level_end,
-                y0=level,
-                y1=level,
+                x=[
+                    start_time,
+                    last_time,
+                ],
+                y=[
+                    level,
+                    level,
+                ],
+                mode="lines",
                 line={
                     "color": line_color,
                     "width": 2,
                     "dash": "dot",
                 },
+                name=label,
+                legendgroup=group,
+                showlegend=group not in shown_groups,
+                hovertemplate=(
+                    f"<b>{label}</b><br>"
+                    f"Level: {level:.2f}<br>"
+                    "<extra></extra>"
+                ),
             )
+        )
 
-            fig.add_annotation(
-                x=level_end,
-                y=level,
-                text=f"<b>{label}</b>",
-                showarrow=False,
-                xanchor="right",
-                yshift=10,
-                font={
-                    "color": line_color,
-                    "size": 11,
-                },
-                bgcolor="rgba(15, 15, 15, 0.75)",
-                bordercolor=line_color,
-                borderwidth=1,
-                borderpad=3,
-            )
+        shown_groups.add(group)
 
     # -----------------------------------------------------
-    # PREVIOUS DAILY HIGH
+    # BOS MARKERS
     # -----------------------------------------------------
 
-    previous_high = get_latest_nonempty_value(
+    add_structure_markers(
+        fig=fig,
+        data=data,
+        first_time=first_time,
+        signal_column="Structure_BOS",
+        definitions=[
+            (
+                1,
+                "Bullish BOS",
+                "#00e676",
+                "triangle-up",
+            ),
+            (
+                -1,
+                "Bearish BOS",
+                "#ff1744",
+                "triangle-down",
+            ),
+        ],
+    )
+
+    # -----------------------------------------------------
+    # CHoCH MARKERS
+    # -----------------------------------------------------
+
+    add_structure_markers(
+        fig=fig,
+        data=data,
+        first_time=first_time,
+        signal_column="Structure_CHOCH",
+        definitions=[
+            (
+                1,
+                "Bullish CHoCH",
+                "#00e5ff",
+                "diamond",
+            ),
+            (
+                -1,
+                "Bearish CHoCH",
+                "#ffb300",
+                "diamond",
+            ),
+        ],
+    )
+
+    # -----------------------------------------------------
+    # PREVIOUS DAILY HIGH AND LOW
+    # -----------------------------------------------------
+
+    previous_high = latest_value(
         chart_data,
         "Daily_PreviousHigh",
     )
 
-    if previous_high is not None:
-        previous_high = float(previous_high)
-
-        fig.add_hline(
-            y=previous_high,
-            line_dash="dash",
-            line_width=2,
-            line_color="#00e5ff",
-            annotation_text=(
-                f"Previous Daily High: "
-                f"{previous_high:.2f}"
-            ),
-            annotation_position="top right",
-            annotation_font={
-                "size": 12,
-                "color": "#00e5ff",
-            },
-        )
-
-    # -----------------------------------------------------
-    # PREVIOUS DAILY LOW
-    # -----------------------------------------------------
-
-    previous_low = get_latest_nonempty_value(
+    previous_low = latest_value(
         chart_data,
         "Daily_PreviousLow",
     )
 
+    if previous_high is not None:
+
+        previous_high = float(
+            previous_high
+        )
+
+        fig.add_hline(
+            y=previous_high,
+            line_color="#00e5ff",
+            line_width=2,
+            line_dash="dash",
+            annotation_text=(
+                f"PDH {previous_high:.2f}"
+            ),
+            annotation_position="top right",
+        )
+
     if previous_low is not None:
-        previous_low = float(previous_low)
+
+        previous_low = float(
+            previous_low
+        )
 
         fig.add_hline(
             y=previous_low,
-            line_dash="dash",
-            line_width=2,
             line_color="#ff00e6",
+            line_width=2,
+            line_dash="dash",
             annotation_text=(
-                f"Previous Daily Low: "
-                f"{previous_low:.2f}"
+                f"PDL {previous_low:.2f}"
             ),
             annotation_position="bottom right",
-            annotation_font={
-                "size": 12,
-                "color": "#ff55eb",
-            },
         )
 
     # -----------------------------------------------------
     # CURRENT PRICE
     # -----------------------------------------------------
 
-    latest_close = float(
-        chart_data["close"].iloc[-1]
-    )
-
     fig.add_hline(
-        y=latest_close,
-        line_dash="dot",
-        line_width=1.5,
+        y=current_price,
         line_color="white",
+        line_width=1.4,
+        line_dash="dot",
         annotation_text=(
-            f"Current Price: {latest_close:.2f}"
+            f"Price {current_price:.2f}"
         ),
         annotation_position="bottom right",
-        annotation_font={
-            "size": 11,
-            "color": "white",
-        },
     )
 
     # -----------------------------------------------------
     # LAYOUT
     # -----------------------------------------------------
 
-    right_padding = pd.Timedelta(
-        minutes=TIMEFRAME_MINUTES * 2
-    )
-
-    range_breaks = [
-        {
-            "bounds": ["sat", "mon"],
-        }
-    ]
-
     fig.update_layout(
         title={
             "text": (
                 f"<b>{SYMBOL} {TIMEFRAME_NAME}</b>"
                 "<br>"
-                "<sup>Smart Money Concepts Analysis</sup>"
+                "<sup>"
+                "Hover over zones for details. "
+                "Click legend items to hide or show groups."
+                "</sup>"
             ),
             "x": 0.5,
             "xanchor": "center",
-            "font": {
-                "size": 24,
-            },
         },
         template="plotly_dark",
+        height=1050,
         autosize=True,
-        height=1100,
         hovermode="closest",
         dragmode="pan",
         paper_bgcolor="#101215",
@@ -1097,11 +876,12 @@ def create_interactive_chart(
         legend={
             "orientation": "h",
             "yanchor": "bottom",
-            "y": 1.01,
+            "y": 1.02,
             "xanchor": "center",
             "x": 0.5,
-            "bgcolor": "rgba(15, 15, 15, 0.75)",
-            "bordercolor": "#444",
+            "groupclick": "togglegroup",
+            "bgcolor": "rgba(15,15,15,0.80)",
+            "bordercolor": "#555",
             "borderwidth": 1,
             "font": {
                 "size": 11,
@@ -1109,60 +889,53 @@ def create_interactive_chart(
         },
         margin={
             "l": 80,
-            "r": 190,
-            "t": 145,
-            "b": 100,
+            "r": 150,
+            "t": 140,
+            "b": 90,
         },
         hoverlabel={
-            "bgcolor": "#1d2127",
+            "bgcolor": "#20242a",
             "font_size": 12,
-            "font_family": "Arial",
-        },
-        modebar={
-            "orientation": "v",
-            "bgcolor": "rgba(30, 30, 30, 0.8)",
-            "color": "white",
-            "activecolor": "#00e5ff",
         },
     )
 
     fig.update_xaxes(
-        type="date",
         range=[
             first_time,
-            last_time + right_padding,
+            last_time
+            + pd.Timedelta(
+                minutes=TIMEFRAME_MINUTES * 3
+            ),
         ],
-        rangebreaks=range_breaks,
+        rangebreaks=[
+            {
+                "bounds": [
+                    "sat",
+                    "mon",
+                ],
+            }
+        ],
         rangeslider={
             "visible": True,
-            "thickness": 0.08,
-            "bgcolor": "#181b20",
-            "bordercolor": "#444",
-            "borderwidth": 1,
+            "thickness": 0.07,
         },
         rangeselector={
             "buttons": [
                 {
                     "count": 1,
-                    "label": "1 Day",
+                    "label": "1D",
                     "step": "day",
                     "stepmode": "backward",
                 },
                 {
                     "count": 3,
-                    "label": "3 Days",
+                    "label": "3D",
                     "step": "day",
                     "stepmode": "backward",
                 },
                 {
                     "count": 7,
-                    "label": "1 Week",
-                    "step": "day",
-                    "stepmode": "backward",
-                },
-                {
-                    "count": 14,
-                    "label": "2 Weeks",
+                    "label": "1W",
                     "step": "day",
                     "stepmode": "backward",
                 },
@@ -1171,61 +944,21 @@ def create_interactive_chart(
                     "label": "All",
                 },
             ],
-            "bgcolor": "#22262c",
-            "activecolor": "#00a8cc",
-            "bordercolor": "#555",
-            "borderwidth": 1,
-            "font": {
-                "color": "white",
-                "size": 11,
-            },
             "x": 0,
             "y": 1.08,
         },
-        showgrid=True,
         gridcolor="#29313a",
-        gridwidth=1,
         showspikes=True,
-        spikemode="across",
-        spikesnap="cursor",
         spikecolor="#dddddd",
-        spikethickness=1,
-        tickfont={
-            "size": 12,
-        },
+        spikemode="across",
     )
 
     fig.update_yaxes(
-        showgrid=True,
         gridcolor="#29313a",
-        gridwidth=1,
-        fixedrange=False,
-        showspikes=True,
-        spikemode="across",
-        spikesnap="cursor",
-        spikecolor="#dddddd",
-        spikethickness=1,
         tickformat=".2f",
-        tickfont={
-            "size": 12,
-        },
-    )
-
-    fig.add_annotation(
-        xref="paper",
-        yref="paper",
-        x=0,
-        y=-0.16,
-        text=(
-            "Mouse wheel: zoom | Drag: move chart | "
-            "Double-click: reset | Camera icon: save PNG"
-        ),
-        showarrow=False,
-        font={
-            "size": 11,
-            "color": "#aeb7c2",
-        },
-        xanchor="left",
+        showspikes=True,
+        spikecolor="#dddddd",
+        spikemode="across",
     )
 
     output_path = Path(
@@ -1236,18 +969,16 @@ def create_interactive_chart(
         "responsive": True,
         "scrollZoom": True,
         "displaylogo": False,
-        "showTips": True,
         "modeBarButtonsToAdd": [
             "drawline",
-            "drawopenpath",
             "drawrect",
             "eraseshape",
         ],
         "toImageButtonOptions": {
             "format": "png",
             "filename": "xauusd_m15_smc_chart",
-            "height": 1200,
             "width": 2200,
+            "height": 1200,
             "scale": 2,
         },
     }
@@ -1255,9 +986,9 @@ def create_interactive_chart(
     fig.write_html(
         str(output_path),
         include_plotlyjs=True,
+        full_html=True,
         auto_open=False,
         config=chart_config,
-        full_html=True,
     )
 
     return output_path
@@ -1271,7 +1002,7 @@ def count_signals(
     results: pd.DataFrame,
     column: str,
 ) -> int:
-    """Count real non-zero signals."""
+    """Count actual non-zero signals."""
 
     if column not in results.columns:
         return 0
@@ -1298,12 +1029,12 @@ def print_summary(
     print(f"Time:  {latest['time']}")
     print(f"Close: {latest['close']:.2f}")
 
-    previous_high = get_latest_nonempty_value(
+    previous_high = latest_value(
         results,
         "Daily_PreviousHigh",
     )
 
-    previous_low = get_latest_nonempty_value(
+    previous_low = latest_value(
         results,
         "Daily_PreviousLow",
     )
@@ -1355,6 +1086,7 @@ def print_summary(
 # =========================================================
 
 def main() -> None:
+
     print("Connecting to MetaTrader 5...")
 
     if not mt5.initialize():
@@ -1364,6 +1096,7 @@ def main() -> None:
         )
 
     try:
+
         print(
             f"Downloading {NUMBER_OF_CANDLES} completed "
             f"{SYMBOL} {TIMEFRAME_NAME} candles..."
@@ -1394,10 +1127,12 @@ def main() -> None:
             index=False,
         )
 
-        print("Creating the interactive chart...")
+        print(
+            "Creating the clean interactive chart..."
+        )
 
         chart_path = create_interactive_chart(
-            results,
+            results=results,
             number_of_candles=CHART_CANDLES,
         )
 
@@ -1417,11 +1152,16 @@ def main() -> None:
         )
 
     except Exception as error:
+
         print(f"\nError: {error}")
 
     finally:
+
         mt5.shutdown()
-        print("\nMetaTrader 5 connection closed.")
+
+        print(
+            "\nMetaTrader 5 connection closed."
+        )
 
 
 if __name__ == "__main__":
