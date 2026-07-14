@@ -1,4 +1,5 @@
 MetaTrader5
+backtesting
 mplfinance
 pandas
 plotly

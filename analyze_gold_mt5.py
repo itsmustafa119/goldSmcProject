@@ -19,6 +19,7 @@ from matplotlib.colors import to_rgba
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch, Rectangle
 from smartmoneyconcepts import smc
+from smc_backtest import run_smc_backtest
 
 
 # =========================================================
@@ -56,6 +57,18 @@ CSV_OUTPUT_FILE = "xauusd_m15_smc_results.csv"
 HTML_OUTPUT_FILE = "xauusd_m15_smc_chart.html"
 MPLFINANCE_OUTPUT_FILE = "xauusd_m15_smc_snapshot.png"
 MPLFINANCE_CANDLES = 300
+BACKTEST_OUTPUT_FILE = "xauusd_m15_smc_backtest.html"
+BACKTEST_TRADES_FILE = "xauusd_m15_smc_trades.csv"
+
+# Baseline backtest assumptions. These are intentionally visible in the
+# dashboard because historical results depend heavily on execution costs,
+# leverage, sizing, and exit rules.
+BACKTEST_CASH = 100_000
+BACKTEST_SPREAD = 0.0001
+BACKTEST_MARGIN = 0.05
+BACKTEST_POSITION_FRACTION = 0.10
+BACKTEST_RISK_REWARD = 2.0
+BACKTEST_ATR_MULTIPLIER = 1.5
 
 # Live dashboard settings. Set LIVE_MODE to False to create a
 # standalone HTML file once and exit as before.
@@ -177,6 +190,142 @@ def get_mt5_candles(
 # CALCULATE SMC INDICATORS
 # =========================================================
 
+def calculate_structure_map(
+    data: pd.DataFrame,
+    swings: pd.DataFrame,
+) -> pd.DataFrame:
+    """Classify confirmed swings and the current dealing range."""
+
+    structure = pd.DataFrame(
+        index=data.index,
+        data={
+            "Support": float("nan"),
+            "Resistance": float("nan"),
+            "SwingLabel": pd.Series(
+                pd.NA,
+                index=data.index,
+                dtype="object",
+            ),
+            "State": pd.Series(
+                "Insufficient structure",
+                index=data.index,
+                dtype="object",
+            ),
+            "RangeHigh": float("nan"),
+            "RangeLow": float("nan"),
+            "Equilibrium": float("nan"),
+            "RangeStartIndex": float("nan"),
+            "Zone": pd.Series(
+                "Unavailable",
+                index=data.index,
+                dtype="object",
+            ),
+        },
+    )
+
+    last_high = None
+    previous_high = None
+    last_high_index = None
+    last_low = None
+    previous_low = None
+    last_low_index = None
+    state = "Insufficient structure"
+
+    for index in data.index:
+        direction = swings.at[index, "HighLow"]
+        level = swings.at[index, "Level"]
+
+        if pd.notna(direction) and pd.notna(level):
+            level = float(level)
+
+            if float(direction) == 1:
+                structure.at[index, "Resistance"] = level
+                structure.at[index, "SwingLabel"] = (
+                    "SH"
+                    if last_high is None
+                    else "HH"
+                    if level > last_high
+                    else "LH"
+                    if level < last_high
+                    else "EH"
+                )
+                previous_high = last_high
+                last_high = level
+                last_high_index = int(index)
+
+            elif float(direction) == -1:
+                structure.at[index, "Support"] = level
+                structure.at[index, "SwingLabel"] = (
+                    "SL"
+                    if last_low is None
+                    else "HL"
+                    if level > last_low
+                    else "LL"
+                    if level < last_low
+                    else "EL"
+                )
+                previous_low = last_low
+                last_low = level
+                last_low_index = int(index)
+
+        if (
+            previous_high is not None
+            and previous_low is not None
+            and last_high is not None
+            and last_low is not None
+        ):
+            higher_high = last_high > previous_high
+            higher_low = last_low > previous_low
+            lower_high = last_high < previous_high
+            lower_low = last_low < previous_low
+
+            if higher_high and higher_low:
+                state = "Uptrend"
+            elif lower_high and lower_low:
+                state = "Downtrend"
+            else:
+                state = "Transition / range"
+
+        structure.at[index, "State"] = state
+
+        if (
+            last_high is None
+            or last_low is None
+            or last_high_index is None
+            or last_low_index is None
+        ):
+            continue
+
+        range_high = max(last_high, last_low)
+        range_low = min(last_high, last_low)
+        equilibrium = (range_high + range_low) / 2
+        range_size = range_high - range_low
+        close = float(data.at[index, "close"])
+
+        structure.at[index, "RangeHigh"] = range_high
+        structure.at[index, "RangeLow"] = range_low
+        structure.at[index, "Equilibrium"] = equilibrium
+        structure.at[index, "RangeStartIndex"] = min(
+            last_high_index,
+            last_low_index,
+        )
+
+        if close > range_high:
+            zone = "Above dealing range"
+        elif close < range_low:
+            zone = "Below dealing range"
+        elif range_size > 0 and abs(close - equilibrium) <= range_size * 0.02:
+            zone = "Equilibrium"
+        elif close < equilibrium:
+            zone = "Discount"
+        else:
+            zone = "Premium"
+
+        structure.at[index, "Zone"] = zone
+
+    return structure
+
+
 def calculate_smc_indicators(
     data: pd.DataFrame,
 ) -> pd.DataFrame:
@@ -190,6 +339,11 @@ def calculate_smc_indicators(
     fair_value_gaps = smc.fvg(
         data,
         join_consecutive=False,
+    )
+
+    structure_map = calculate_structure_map(
+        data,
+        swings,
     )
 
     market_structure = smc.bos_choch(
@@ -261,6 +415,10 @@ def calculate_smc_indicators(
             .reset_index(drop=True)
             .add_prefix("Swing_"),
 
+            structure_map
+            .reset_index(drop=True)
+            .add_prefix("Trend_"),
+
             fair_value_gaps
             .reset_index(drop=True)
             .add_prefix("FVG_"),
@@ -307,6 +465,15 @@ def validate_indicator_results(
     expected_columns = {
         "Swing_HighLow",
         "Swing_Level",
+        "Trend_Support",
+        "Trend_Resistance",
+        "Trend_SwingLabel",
+        "Trend_State",
+        "Trend_RangeHigh",
+        "Trend_RangeLow",
+        "Trend_Equilibrium",
+        "Trend_RangeStartIndex",
+        "Trend_Zone",
         "FVG_FVG",
         "FVG_Top",
         "FVG_Bottom",
@@ -453,6 +620,36 @@ def latest_value(
     return values.iloc[-1]
 
 
+def nearest_structure_level(
+    data: pd.DataFrame,
+    column: str,
+    current_price: float,
+    *,
+    above_price: bool,
+):
+    """Return the closest confirmed structure level on one side of price."""
+
+    if column not in data.columns:
+        return None
+
+    levels = pd.to_numeric(
+        data[column],
+        errors="coerce",
+    ).dropna()
+
+    levels = (
+        levels[levels >= current_price]
+        if above_price
+        else levels[levels <= current_price]
+    )
+
+    if levels.empty:
+        return None
+
+    distances = (levels - current_price).abs()
+    return float(levels.loc[distances.idxmin()])
+
+
 def retracement_status(
     data: pd.DataFrame,
 ) -> str:
@@ -499,8 +696,138 @@ def retracement_status(
     )
 
 
+def build_backtest_dashboard(
+    summary: dict | None,
+) -> str:
+    """Build backtest metrics, assumptions, and recent trades."""
+
+    if not summary:
+        return """
+<section class="backtest-dashboard" aria-labelledby="backtest-title">
+    <header class="reference-header">
+        <p class="eyebrow">Historical strategy simulation</p>
+        <h2 id="backtest-title">Backtest unavailable</h2>
+        <p>The backtest did not produce a result during this refresh.</p>
+    </header>
+</section>
+"""
+
+    def metric(
+        key: str,
+        *,
+        suffix: str = "",
+        decimals: int = 2,
+        money: bool = False,
+    ) -> str:
+        value = summary.get(key)
+
+        if value is None or pd.isna(value):
+            return "—"
+
+        if money:
+            return f"${float(value):,.2f}"
+
+        return f"{float(value):,.{decimals}f}{suffix}"
+
+    trade_rows = []
+
+    for trade in summary.get("recent_trades", []):
+        outcome_class = (
+            "trade-win"
+            if trade["outcome"] == "Win"
+            else "trade-loss"
+            if trade["outcome"] == "Loss"
+            else ""
+        )
+        trade_rows.append(
+            "<tr>"
+            f"<td>{trade['direction']}</td>"
+            f"<td>{trade['entry_time']}</td>"
+            f"<td>{trade['exit_time']}</td>"
+            f"<td>{trade['entry_price']:,.2f}</td>"
+            f"<td>{trade['exit_price']:,.2f}</td>"
+            f"<td class=\"{outcome_class}\">{trade['pnl']:,.2f}</td>"
+            f"<td class=\"{outcome_class}\">{trade['return_pct']:,.2f}%</td>"
+            "</tr>"
+        )
+
+    table_body = (
+        "".join(trade_rows)
+        if trade_rows
+        else "<tr><td colspan=\"7\">No completed trades for this rule set.</td></tr>"
+    )
+
+    leverage = (
+        1 / float(summary["margin"])
+        if float(summary.get("margin", 0)) > 0
+        else 1
+    )
+
+    return f"""
+<section class="backtest-dashboard" aria-labelledby="backtest-title">
+    <header class="dashboard-header">
+        <div>
+            <p class="eyebrow">Historical strategy simulation</p>
+            <h2 id="backtest-title">SMC pullback backtest</h2>
+            <p>{summary['start']} to {summary['end']} · Confirmed trend + structure bias + discount/premium pullback · ATR stop · {summary['risk_reward']:.1f}R target.</p>
+        </div>
+        <div class="backtest-links">
+            <a class="back-to-chart" href="{BACKTEST_OUTPUT_FILE}" target="_blank" rel="noopener">Interactive results</a>
+            <a class="back-to-chart" href="{BACKTEST_TRADES_FILE}" download>Trade CSV</a>
+        </div>
+    </header>
+
+    <div class="metric-grid backtest-metrics">
+        <article class="metric-card metric-primary">
+            <span>Strategy return</span>
+            <strong>{metric('return_pct', suffix='%')}</strong>
+            <small>Buy &amp; hold {metric('buy_hold_return_pct', suffix='%')}</small>
+        </article>
+        <article class="metric-card">
+            <span>Completed trades</span>
+            <strong>{summary['trades']}</strong>
+            <small>{summary['long_setups']} long · {summary['short_setups']} short setups</small>
+        </article>
+        <article class="metric-card">
+            <span>Win rate</span>
+            <strong>{metric('win_rate_pct', suffix='%')}</strong>
+            <small>Expectancy {metric('expectancy_pct', suffix='%')}</small>
+        </article>
+        <article class="metric-card">
+            <span>Maximum drawdown</span>
+            <strong>{metric('max_drawdown_pct', suffix='%')}</strong>
+            <small>Profit factor {metric('profit_factor')}</small>
+        </article>
+        <article class="metric-card">
+            <span>Final equity</span>
+            <strong>{metric('equity_final', money=True)}</strong>
+            <small>Starting cash ${summary['cash']:,.0f}</small>
+        </article>
+        <article class="metric-card metric-wide">
+            <span>Execution assumptions</span>
+            <strong>{summary['position_fraction'] * 100:.0f}% liquidity per trade · {leverage:.0f}:1 leverage</strong>
+            <small>{summary['spread'] * 10_000:.1f} bp spread · close-bar fills · {summary['atr_multiplier']:.1f} ATR minimum stop · pivots delayed {summary['swing_confirmation_bars']} candles</small>
+        </article>
+    </div>
+
+    <div class="trade-table-wrap">
+        <table class="trade-table">
+            <caption>Most recent completed trades</caption>
+            <thead>
+                <tr><th>Side</th><th>Entry</th><th>Exit</th><th>Entry price</th><th>Exit price</th><th>P&amp;L</th><th>Return</th></tr>
+            </thead>
+            <tbody>{table_body}</tbody>
+        </table>
+    </div>
+
+    <p class="analysis-disclaimer">Hypothetical historical simulation only—not a forecast or trading recommendation. Results omit slippage beyond the configured spread, financing, broker-specific contract sizing, news restrictions, and execution failures. Parameters were not optimized on this sample.</p>
+</section>
+"""
+
+
 def build_analysis_dashboard(
     data: pd.DataFrame,
+    backtest_summary: dict | None = None,
 ) -> str:
     """Build summary metrics and an indicator reference section."""
 
@@ -613,6 +940,39 @@ def build_analysis_dashboard(
     )
 
     retracement_text = retracement_status(data)
+    current_price = float(latest["close"])
+    trend_state = str(
+        latest.get("Trend_State", "Unavailable")
+    )
+    dealing_zone = str(
+        latest.get("Trend_Zone", "Unavailable")
+    )
+    nearest_support = nearest_structure_level(
+        data,
+        "Trend_Support",
+        current_price,
+        above_price=False,
+    )
+    nearest_resistance = nearest_structure_level(
+        data,
+        "Trend_Resistance",
+        current_price,
+        above_price=True,
+    )
+    support_text = (
+        f"{nearest_support:,.2f}"
+        if nearest_support is not None
+        else "—"
+    )
+    resistance_text = (
+        f"{nearest_resistance:,.2f}"
+        if nearest_resistance is not None
+        else "—"
+    )
+
+    backtest_html = build_backtest_dashboard(
+        backtest_summary
+    )
 
     return f"""
 <section id="chart-summary" class="analysis-dashboard" aria-labelledby="summary-title">
@@ -645,6 +1005,16 @@ def build_analysis_dashboard(
             <span>Active zones</span>
             <strong>{fvg_count} FVG · {ob_count} OB</strong>
             <small>{liquidity_count} unswept liquidity pools</small>
+        </article>
+        <article class="metric-card">
+            <span>Swing trend</span>
+            <strong>{trend_state}</strong>
+            <small>HH/HL confirms uptrend · LH/LL confirms downtrend</small>
+        </article>
+        <article class="metric-card">
+            <span>Dealing range</span>
+            <strong>{dealing_zone}</strong>
+            <small>Support {support_text} · Resistance {resistance_text}</small>
         </article>
         <article class="metric-card metric-wide">
             <span>Latest confirmed structure</span>
@@ -684,6 +1054,16 @@ def build_analysis_dashboard(
             <p><strong>BOS:</strong> A confirmed structural break commonly interpreted as continuation.</p>
             <p><strong>CHoCH:</strong> A confirmed change in swing sequence that can warn of a possible regime shift or reversal.</p>
         </article>
+        <article class="definition-card structure-map-definition">
+            <h3>Structure Map <span>HH / HL / LH / LL</span></h3>
+            <p><strong>Definition:</strong> Confirmed swing highs and lows are compared with the previous pivot of the same type to classify trend structure and nearby support or resistance.</p>
+            <p><strong>Use:</strong> HH plus HL supports an uptrend; LH plus LL supports a downtrend. Mixed pairs indicate transition or range conditions.</p>
+        </article>
+        <article class="definition-card dealing-range-definition">
+            <h3>Premium and Discount</h3>
+            <p><strong>Definition:</strong> The midpoint of the latest confirmed high-low dealing range is equilibrium. Price below it is discount; price above it is premium.</p>
+            <p><strong>Use:</strong> Combine the zone with directional structure and confirmation. A discount reading alone is not a buy signal, and premium alone is not a sell signal.</p>
+        </article>
         <article class="definition-card swing-definition">
             <h3>Swing Highs and Lows</h3>
             <p><strong>Definition:</strong> Confirmed pivots that are highest or lowest across the configured candles before and after.</p>
@@ -708,6 +1088,7 @@ def build_analysis_dashboard(
 
     <p class="analysis-disclaimer">Educational analysis only. SMC labels are algorithmic interpretations and should not be used as the sole basis for a trade.</p>
 </section>
+{backtest_html}
 """
 
 
@@ -867,6 +1248,220 @@ def add_swing_markers(
                 legendgroup="swings",
                 hovertemplate=(
                     f"<b>{label}</b><br>"
+                    "Level: %{y:.2f}<br>"
+                    "Time: %{x}<extra></extra>"
+                ),
+            )
+        )
+
+
+def add_structure_map(
+    fig: go.Figure,
+    data: pd.DataFrame,
+    first_time,
+    last_time,
+    current_price: float,
+) -> None:
+    """Draw trend labels, nearby S/R, and the latest dealing range."""
+
+    required_columns = {
+        "Trend_Support",
+        "Trend_Resistance",
+        "Trend_SwingLabel",
+        "Trend_RangeHigh",
+        "Trend_RangeLow",
+        "Trend_Equilibrium",
+        "Trend_RangeStartIndex",
+    }
+
+    if not required_columns.issubset(data.columns):
+        return
+
+    latest = data.iloc[-1]
+    range_high = latest["Trend_RangeHigh"]
+    range_low = latest["Trend_RangeLow"]
+    equilibrium = latest["Trend_Equilibrium"]
+    range_start_index = latest["Trend_RangeStartIndex"]
+
+    if all(
+        pd.notna(value)
+        for value in [
+            range_high,
+            range_low,
+            equilibrium,
+            range_start_index,
+        ]
+    ):
+        range_high = float(range_high)
+        range_low = float(range_low)
+        equilibrium = float(equilibrium)
+        range_start = max(
+            get_index_time(
+                data,
+                range_start_index,
+                first_time,
+            ),
+            first_time,
+        )
+
+        if range_start < last_time and range_high > range_low:
+            fig.add_shape(
+                type="rect",
+                xref="x",
+                yref="y",
+                x0=range_start,
+                x1=last_time,
+                y0=range_low,
+                y1=equilibrium,
+                fillcolor="rgba(0, 205, 110, 0.055)",
+                line={"width": 0},
+                layer="below",
+                legendgroup="trendmap",
+                name="Discount Range",
+                showlegend=False,
+            )
+            fig.add_shape(
+                type="rect",
+                xref="x",
+                yref="y",
+                x0=range_start,
+                x1=last_time,
+                y0=equilibrium,
+                y1=range_high,
+                fillcolor="rgba(255, 77, 91, 0.05)",
+                line={"width": 0},
+                layer="below",
+                legendgroup="trendmap",
+                name="Premium Range",
+                showlegend=False,
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=[range_start, last_time],
+                    y=[equilibrium, equilibrium],
+                    mode="lines+text",
+                    text=[None, "EQ"],
+                    textposition="top left",
+                    textfont={
+                        "color": "#dce5ed",
+                        "size": 10,
+                    },
+                    line={
+                        "color": "rgba(220, 229, 237, 0.74)",
+                        "width": 1.4,
+                        "dash": "dash",
+                    },
+                    name="Dealing Range Equilibrium",
+                    legendgroup="trendmap",
+                    showlegend=True,
+                    hovertemplate=(
+                        "<b>Equilibrium</b><br>"
+                        f"Level: {equilibrium:.2f}<extra></extra>"
+                    ),
+                )
+            )
+
+    level_specs = [
+        (
+            "Trend_Support",
+            False,
+            "Support",
+            "#00bfa5",
+            "S",
+        ),
+        (
+            "Trend_Resistance",
+            True,
+            "Resistance",
+            "#ff6e78",
+            "R",
+        ),
+    ]
+
+    for column, above_price, label, color, short_label in level_specs:
+        levels = data[
+            data[column].notna()
+        ].copy()
+
+        if above_price:
+            levels = levels[
+                levels[column].astype(float) >= current_price
+            ]
+        else:
+            levels = levels[
+                levels[column].astype(float) <= current_price
+            ]
+
+        if levels.empty:
+            continue
+
+        levels["_distance"] = (
+            levels[column].astype(float) - current_price
+        ).abs()
+
+        for _, row in levels.nsmallest(2, "_distance").iterrows():
+            level = float(row[column])
+            start_time = max(row["time"], first_time)
+
+            fig.add_trace(
+                go.Scatter(
+                    x=[start_time, last_time],
+                    y=[level, level],
+                    mode="lines+text",
+                    text=[None, f"{short_label} {level:.2f}"],
+                    textposition="top left",
+                    textfont={
+                        "color": color,
+                        "size": 9,
+                    },
+                    line={
+                        "color": color,
+                        "width": 1.3,
+                        "dash": "longdash",
+                    },
+                    name=f"Confirmed {label}",
+                    legendgroup="trendmap",
+                    showlegend=False,
+                    hovertemplate=(
+                        f"<b>Confirmed {label}</b><br>"
+                        f"Level: {level:.2f}<br>"
+                        f"Pivot: {row['time']}<extra></extra>"
+                    ),
+                )
+            )
+
+    label_rows = data[
+        (data["time"] >= first_time)
+        & data["Trend_SwingLabel"].notna()
+    ].tail(MAX_SWING_MARKERS)
+
+    for column, position in [
+        ("Trend_Resistance", "top center"),
+        ("Trend_Support", "bottom center"),
+    ]:
+        selected = label_rows[
+            label_rows[column].notna()
+        ]
+
+        if selected.empty:
+            continue
+
+        fig.add_trace(
+            go.Scatter(
+                x=selected["time"],
+                y=selected[column],
+                mode="text",
+                text=selected["Trend_SwingLabel"],
+                textposition=position,
+                textfont={
+                    "color": "rgba(220, 230, 238, 0.80)",
+                    "size": 9,
+                },
+                name="HH / HL / LH / LL",
+                legendgroup="trendmap",
+                showlegend=False,
+                hovertemplate=(
+                    "<b>%{text}</b><br>"
                     "Level: %{y:.2f}<br>"
                     "Time: %{x}<extra></extra>"
                 ),
@@ -1655,6 +2250,67 @@ def create_mplfinance_snapshot(
                 )
             )
 
+    latest_structure = chart_data.iloc[-1]
+
+    if all(
+        pd.notna(latest_structure.get(column))
+        for column in [
+            "Trend_RangeHigh",
+            "Trend_RangeLow",
+            "Trend_Equilibrium",
+            "Trend_RangeStartIndex",
+        ]
+    ):
+        range_high = float(latest_structure["Trend_RangeHigh"])
+        range_low = float(latest_structure["Trend_RangeLow"])
+        equilibrium = float(latest_structure["Trend_Equilibrium"])
+        range_start = max(
+            float(latest_structure["Trend_RangeStartIndex"]) - first_index,
+            -0.5,
+        )
+        range_width = candle_total - 0.5 - range_start
+
+        if range_high > range_low and range_width > 0:
+            price_axis.add_patch(
+                Rectangle(
+                    (range_start, range_low),
+                    range_width,
+                    equilibrium - range_low,
+                    facecolor=to_rgba("#00cd6e", 0.045),
+                    edgecolor="none",
+                    zorder=0.55,
+                )
+            )
+            price_axis.add_patch(
+                Rectangle(
+                    (range_start, equilibrium),
+                    range_width,
+                    range_high - equilibrium,
+                    facecolor=to_rgba("#ff4d5b", 0.04),
+                    edgecolor="none",
+                    zorder=0.55,
+                )
+            )
+            price_axis.plot(
+                [range_start, candle_total - 0.5],
+                [equilibrium, equilibrium],
+                color=to_rgba("#dce5ed", 0.72),
+                linewidth=0.9,
+                linestyle=(0, (5, 4)),
+                zorder=1.7,
+            )
+            price_axis.text(
+                candle_total - 1.0,
+                equilibrium,
+                f"EQ {equilibrium:.2f}",
+                color="#dce5ed",
+                fontsize=6.7,
+                ha="right",
+                va="bottom",
+                clip_on=True,
+                zorder=3.4,
+            )
+
     zone_specs = [
         {
             "signal": "FVG_FVG",
@@ -1782,6 +2438,48 @@ def create_mplfinance_snapshot(
             zorder=3.5,
         )
 
+    for column, above_price, label, color in [
+        ("Trend_Support", False, "S", "#00bfa5"),
+        ("Trend_Resistance", True, "R", "#ff6e78"),
+    ]:
+        levels = data[data[column].notna()].copy()
+        levels = (
+            levels[levels[column].astype(float) >= current_price]
+            if above_price
+            else levels[levels[column].astype(float) <= current_price]
+        )
+
+        if levels.empty:
+            continue
+
+        levels["_distance"] = (
+            levels[column].astype(float) - current_price
+        ).abs()
+
+        for source_index, row in levels.nsmallest(2, "_distance").iterrows():
+            level = float(row[column])
+            x_start = max(float(source_index - first_index), 0)
+
+            price_axis.plot(
+                [x_start, candle_total - 0.5],
+                [level, level],
+                color=to_rgba(color, 0.80),
+                linewidth=0.9,
+                linestyle=(0, (7, 4)),
+                zorder=1.9,
+            )
+            price_axis.text(
+                candle_total - 1.0,
+                level,
+                f"{label} {level:.2f}",
+                color=color,
+                fontsize=6.7,
+                ha="right",
+                va="bottom",
+                clip_on=True,
+                zorder=3.4,
+            )
+
     visible_swings = chart_data[
         chart_data["Swing_HighLow"].fillna(0).ne(0)
         & chart_data["Swing_Level"].notna()
@@ -1817,6 +2515,29 @@ def create_mplfinance_snapshot(
                 linewidths=1.0,
                 zorder=3.0,
             )
+
+            for source_index, row in selected.iterrows():
+                swing_label = row.get("Trend_SwingLabel")
+
+                if pd.isna(swing_label):
+                    continue
+
+                price_axis.annotate(
+                    str(swing_label),
+                    (
+                        source_index - first_index,
+                        float(row["Swing_Level"]),
+                    ),
+                    xytext=(0, 7 if direction == 1 else -9),
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom" if direction == 1 else "top",
+                    color=to_rgba("#dce6ee", 0.82),
+                    fontsize=6.2,
+                    fontweight="bold",
+                    clip_on=True,
+                    zorder=3.2,
+                )
 
     structure_rows = data[
         (
@@ -1983,6 +2704,27 @@ def create_mplfinance_snapshot(
             linestyle="--",
             label="Sell-side liquidity",
         ),
+        Line2D(
+            [0],
+            [0],
+            color="#00bfa5",
+            linestyle="--",
+            label="Confirmed support",
+        ),
+        Line2D(
+            [0],
+            [0],
+            color="#ff6e78",
+            linestyle="--",
+            label="Confirmed resistance",
+        ),
+        Line2D(
+            [0],
+            [0],
+            color="#dce5ed",
+            linestyle="--",
+            label="Range equilibrium",
+        ),
     ]
     legend = price_axis.legend(
         handles=legend_handles,
@@ -1999,6 +2741,8 @@ def create_mplfinance_snapshot(
         0.08,
         0.025,
         retracement_status(chart_data)
+        + f" | {latest_structure.get('Trend_State', 'Unavailable')}"
+        + f" · {latest_structure.get('Trend_Zone', 'Unavailable')}"
         + " | Shaded rectangles are separate zones; faded dashed zones are mitigated.",
         color="#aab6c1",
         fontsize=8.5,
@@ -2039,6 +2783,7 @@ def create_mplfinance_snapshot(
 def create_interactive_chart(
     results: pd.DataFrame,
     number_of_candles: int = 1200,
+    backtest_summary: dict | None = None,
 ) -> Path:
     """Create a clean interactive SMC chart."""
 
@@ -2375,6 +3120,14 @@ def create_interactive_chart(
         data=chart_data,
     )
 
+    add_structure_map(
+        fig=fig,
+        data=data,
+        first_time=first_time,
+        last_time=last_time,
+        current_price=current_price,
+    )
+
     # -----------------------------------------------------
     # BOS MARKERS
     # -----------------------------------------------------
@@ -2573,13 +3326,37 @@ def create_interactive_chart(
         },
     )
 
+    latest_window_start = max(
+        first_time,
+        last_time - pd.Timedelta(days=3),
+    )
+
+    chart_range_end = (
+        last_time
+        + pd.Timedelta(
+            minutes=TIMEFRAME_MINUTES * 3
+        )
+    )
+
+    default_price_data = chart_data[
+        chart_data["time"] >= latest_window_start
+    ]
+    default_price_low = float(
+        default_price_data["low"].min()
+    )
+    default_price_high = float(
+        default_price_data["high"].max()
+    )
+    default_price_span = max(
+        default_price_high - default_price_low,
+        default_price_high * 0.002,
+    )
+    default_price_padding = default_price_span * 0.08
+
     fig.update_xaxes(
         range=[
-            first_time,
-            last_time
-            + pd.Timedelta(
-                minutes=TIMEFRAME_MINUTES * 3
-            ),
+            latest_window_start,
+            chart_range_end,
         ],
         rangebreaks=[
             {
@@ -2600,6 +3377,11 @@ def create_interactive_chart(
     )
 
     fig.update_yaxes(
+        range=[
+            default_price_low - default_price_padding,
+            default_price_high + default_price_padding,
+        ],
+        autorange=False,
         gridcolor="#29313a",
         tickformat=".2f",
         fixedrange=False,
@@ -2636,18 +3418,6 @@ def create_interactive_chart(
         },
     }
 
-    latest_window_start = max(
-        first_time,
-        last_time - pd.Timedelta(days=3),
-    )
-
-    chart_range_end = (
-        last_time
-        + pd.Timedelta(
-            minutes=TIMEFRAME_MINUTES * 3
-        )
-    )
-
     responsive_script = """
 (() => {
     const plot = document.getElementById("smc-chart");
@@ -2664,6 +3434,7 @@ def create_interactive_chart(
     const yAutoButton = document.getElementById("chart-y-auto");
     const exportButton = document.getElementById("chart-export");
     const mplfinanceButton = document.getElementById("chart-mplfinance");
+    const backtestButton = document.getElementById("chart-backtest");
     const summaryButton = document.getElementById("chart-summary-button");
     const fullscreenButton = document.getElementById("chart-fullscreen");
     const helpButton = document.getElementById("chart-help-button");
@@ -2699,6 +3470,7 @@ def create_interactive_chart(
             "structure_Bearish CHoCH"
         ],
         swings: ["swings"],
+        trendmap: ["trendmap"],
         levels: ["previous_4h"],
         sessions: ["session_London", "session_NewYork"],
         retracements: ["retracements"]
@@ -2763,9 +3535,68 @@ def create_interactive_chart(
             lastTimestamp.getTime() - days * 86400000
         );
 
+        setChartWindow([start.toISOString(), fullRange[1]]);
+    }
+
+    function candlePriceRange(xRange) {
+        const candles = plot.data.find(
+            (trace) => trace.type === "candlestick"
+        );
+
+        if (!candles || !candles.x?.length) return null;
+
+        const start = new Date(xRange[0]).getTime();
+        const end = new Date(xRange[1]).getTime();
+        const lows = [];
+        const highs = [];
+
+        candles.x.forEach((value, index) => {
+            const timestamp = new Date(value).getTime();
+
+            if (timestamp < start || timestamp > end) return;
+
+            const low = Number(candles.low[index]);
+            const high = Number(candles.high[index]);
+
+            if (Number.isFinite(low) && Number.isFinite(high)) {
+                lows.push(low);
+                highs.push(high);
+            }
+        });
+
+        if (!lows.length) return null;
+
+        const low = Math.min(...lows);
+        const high = Math.max(...highs);
+        const span = Math.max(high - low, high * 0.002);
+        const padding = span * 0.08;
+
+        return [low - padding, high + padding];
+    }
+
+    function setChartWindow(xRange) {
+        const priceRange = candlePriceRange(xRange);
+        const updates = {
+            "xaxis.range": xRange
+        };
+
+        if (priceRange) {
+            updates["yaxis.autorange"] = false;
+            updates["yaxis.range"] = priceRange;
+        }
+
+        Plotly.relayout(plot, updates);
+    }
+
+    function fitVisibleCandles() {
+        const xRange = plot?._fullLayout?.xaxis?.range || fullRange;
+        const priceRange = candlePriceRange(xRange);
+
+        if (!priceRange) return;
+
         Plotly.relayout(plot, {
-            "xaxis.range": [start.toISOString(), fullRange[1]],
-            "yaxis.autorange": true
+            "yaxis.autorange": false,
+            "yaxis.range": priceRange
         });
     }
 
@@ -2952,10 +3783,7 @@ def create_interactive_chart(
     });
 
     latestButton?.addEventListener("click", () => {
-        Plotly.relayout(plot, {
-            "xaxis.range": latestRange,
-            "yaxis.autorange": true
-        });
+        setChartWindow(latestRange);
     });
 
     oneWeekButton?.addEventListener("click", () => {
@@ -2963,10 +3791,7 @@ def create_interactive_chart(
     });
 
     fitButton?.addEventListener("click", () => {
-        Plotly.relayout(plot, {
-            "xaxis.range": fullRange,
-            "yaxis.autorange": true
-        });
+        setChartWindow(fullRange);
     });
 
     yZoomInButton?.addEventListener("click", () => {
@@ -2978,9 +3803,7 @@ def create_interactive_chart(
     });
 
     yAutoButton?.addEventListener("click", () => {
-        Plotly.relayout(plot, {
-            "yaxis.autorange": true
-        });
+        fitVisibleCandles();
     });
 
     layerToggles.forEach((toggle) => {
@@ -3042,6 +3865,13 @@ def create_interactive_chart(
         window.open(target, "_blank", "noopener");
     });
 
+    backtestButton?.addEventListener("click", () => {
+        const target = location.protocol === "file:"
+            ? "xauusd_m15_smc_backtest.html"
+            : "/backtest";
+        window.open(target, "_blank", "noopener");
+    });
+
     summaryButton?.addEventListener("click", () => {
         document.getElementById("chart-summary")?.scrollIntoView({
             behavior: "smooth",
@@ -3085,6 +3915,7 @@ def create_interactive_chart(
         if (event.key.toLowerCase() === "i") indicatorButton?.click();
         if (event.key.toLowerCase() === "e") exportButton?.click();
         if (event.key.toLowerCase() === "p") mplfinanceButton?.click();
+        if (event.key.toLowerCase() === "b") backtestButton?.click();
         if (event.key.toLowerCase() === "s") summaryButton?.click();
         if (event.key.toLowerCase() === "h") helpButton?.click();
         if (event.key === "1") oneDayButton?.click();
@@ -3103,6 +3934,7 @@ def create_interactive_chart(
     }
 
     applyResponsiveLayout();
+    setLabelsVisibility(labelsToggle?.checked ?? false);
     restoreChartView();
     pollLiveStatus();
     window.setInterval(
@@ -3499,6 +4331,69 @@ def create_interactive_chart(
             #0d1013;
     }
 
+    .backtest-dashboard {
+        width: min(1440px, 100%);
+        margin: 0 auto;
+        padding: 0 clamp(16px, 4vw, 56px) 64px;
+        color: #e8eef4;
+        background: #0d1013;
+    }
+
+    .backtest-links {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+
+    .backtest-metrics {
+        margin-bottom: 22px;
+    }
+
+    .trade-table-wrap {
+        width: 100%;
+        overflow-x: auto;
+        border: 1px solid #27313a;
+        border-radius: 10px;
+        background: #11161a;
+    }
+
+    .trade-table {
+        width: 100%;
+        min-width: 820px;
+        border-collapse: collapse;
+        font-size: 11px;
+    }
+
+    .trade-table caption {
+        padding: 14px 16px;
+        color: #dce6ee;
+        font-size: 13px;
+        font-weight: 700;
+        text-align: left;
+    }
+
+    .trade-table th,
+    .trade-table td {
+        padding: 10px 12px;
+        border-top: 1px solid #26313a;
+        color: #aab7c2;
+        text-align: left;
+        white-space: nowrap;
+    }
+
+    .trade-table th {
+        color: #dce6ee;
+        background: #171d22;
+    }
+
+    .trade-table .trade-win {
+        color: #65e9cb;
+    }
+
+    .trade-table .trade-loss {
+        color: #ff8c97;
+    }
+
     .dashboard-header,
     .reference-header {
         display: flex;
@@ -3642,6 +4537,8 @@ def create_interactive_chart(
     .ob-definition { --accent: #5d9cff; }
     .liquidity-definition { --accent: #d95cff; }
     .structure-definition { --accent: #00e5ff; }
+    .structure-map-definition { --accent: #7bdcff; }
+    .dealing-range-definition { --accent: #8fe8a6; }
     .swing-definition { --accent: #ff6978; }
     .levels-definition { --accent: #a9b4bf; }
     .sessions-definition { --accent: #ff9b2d; }
@@ -3704,6 +4601,10 @@ def create_interactive_chart(
             padding-top: 30px;
         }
 
+        .backtest-dashboard {
+            padding-bottom: 40px;
+        }
+
         .indicator-panel {
             top: 148px;
             left: 8px;
@@ -3749,6 +4650,7 @@ def create_interactive_chart(
             <button id="chart-summary-button" type="button" title="Open summary and indicator guide (S)">Summary</button>
             <button id="chart-export" type="button" title="Export a PNG image (E)">Export</button>
             <button id="chart-mplfinance" type="button" title="Open the clean mplfinance chart (P)">MPL View</button>
+            <button id="chart-backtest" type="button" title="Open interactive strategy backtest (B)">Backtest</button>
             <button id="chart-fullscreen" type="button" title="Toggle fullscreen (F)" aria-pressed="false">Fullscreen</button>
             <button id="chart-help-button" type="button" title="Chart help and shortcuts (H)">Help</button>
         </span>
@@ -3797,6 +4699,11 @@ def create_interactive_chart(
                 <input type="checkbox" data-layer="swings" checked>
             </label>
             <label class="layer-option">
+                <span class="layer-swatch" style="--swatch:#7bdcff"></span>
+                <span>Structure Map &amp; Range</span>
+                <input type="checkbox" data-layer="trendmap" checked>
+            </label>
+            <label class="layer-option">
                 <span class="layer-swatch" style="--swatch:#a9b4bf"></span>
                 <span>Previous 4H Levels</span>
                 <input type="checkbox" data-layer="levels" checked>
@@ -3817,7 +4724,7 @@ def create_interactive_chart(
             <legend>Display</legend>
             <label class="display-option">
                 <span>Indicator labels</span>
-                <input id="toggle-labels" type="checkbox" checked>
+                <input id="toggle-labels" type="checkbox">
             </label>
             <label class="display-option">
                 <span>Grid lines</span>
@@ -3849,9 +4756,9 @@ def create_interactive_chart(
                 <li>Drag directly on an axis for manual scaling.</li>
             </ul>
             <h3>Keyboard shortcuts</h3>
-            <p>1/3/7: time range · R: all · +/-: vertical zoom · 0: Y Auto · I: indicators · S: summary · E: export · P: mplfinance view · F: fullscreen · H: help</p>
+            <p>1/3/7: time range · R: all · +/-: vertical zoom · 0: Y Auto · I: indicators · S: summary · E: export · P: mplfinance view · B: backtest · F: fullscreen · H: help</p>
             <h3>Indicator abbreviations</h3>
-            <p>FVG: Fair Value Gap · OB: Order Block · BSL/SSL: buy-side/sell-side liquidity · PH/PL: previous high/low · C/D: current/deepest retracement.</p>
+            <p>FVG: Fair Value Gap · OB: Order Block · BSL/SSL: buy-side/sell-side liquidity · HH/HL/LH/LL: swing sequence · EQ: dealing-range midpoint · PH/PL: previous high/low · C/D: current/deepest retracement.</p>
             <div class="help-footer">
                 <button id="close-help" type="button">Done</button>
             </div>
@@ -3865,7 +4772,8 @@ def create_interactive_chart(
     )
 
     dashboard_html = build_analysis_dashboard(
-        data
+        data,
+        backtest_summary=backtest_summary,
     )
 
     html = html.replace(
@@ -3999,9 +4907,31 @@ def analyze_and_write_outputs(
             missing_ok=True
         )
 
+    backtest_summary = None
+
+    try:
+        backtest_summary = run_smc_backtest(
+            results,
+            output_file=BACKTEST_OUTPUT_FILE,
+            trades_file=BACKTEST_TRADES_FILE,
+            swing_confirmation_bars=SWING_LENGTH,
+            cash=BACKTEST_CASH,
+            spread=BACKTEST_SPREAD,
+            margin=BACKTEST_MARGIN,
+            position_fraction=BACKTEST_POSITION_FRACTION,
+            risk_reward=BACKTEST_RISK_REWARD,
+            atr_multiplier=BACKTEST_ATR_MULTIPLIER,
+        )
+    except Exception as backtest_error:
+        print(
+            "Backtest warning: "
+            f"{backtest_error}"
+        )
+
     chart_path = create_interactive_chart(
         results=results,
         number_of_candles=CHART_CANDLES,
+        backtest_summary=backtest_summary,
     )
 
     create_mplfinance_snapshot(
@@ -4182,6 +5112,52 @@ class LiveDashboardRequestHandler(
             )
             return
 
+        if request_path in {
+            "/backtest",
+            f"/{BACKTEST_OUTPUT_FILE}",
+        }:
+            backtest_path = Path(
+                BACKTEST_OUTPUT_FILE
+            ).resolve()
+
+            if not backtest_path.exists():
+                self.send_bytes(
+                    503,
+                    "text/plain; charset=utf-8",
+                    b"The backtest is still being generated.",
+                )
+                return
+
+            self.send_bytes(
+                200,
+                "text/html; charset=utf-8",
+                backtest_path.read_bytes(),
+            )
+            return
+
+        if request_path in {
+            "/backtest-trades.csv",
+            f"/{BACKTEST_TRADES_FILE}",
+        }:
+            trades_path = Path(
+                BACKTEST_TRADES_FILE
+            ).resolve()
+
+            if not trades_path.exists():
+                self.send_bytes(
+                    503,
+                    "text/plain; charset=utf-8",
+                    b"The backtest trade list is still being generated.",
+                )
+                return
+
+            self.send_bytes(
+                200,
+                "text/csv; charset=utf-8",
+                trades_path.read_bytes(),
+            )
+            return
+
         if request_path == "/favicon.ico":
             self.send_bytes(
                 204,
@@ -4327,6 +5303,16 @@ def print_summary(
         f"{count_signals(results, 'OB_OB')}"
     )
 
+    print(
+        f"Swing trend:     "
+        f"{latest.get('Trend_State', 'Unavailable')}"
+    )
+
+    print(
+        f"Dealing range:   "
+        f"{latest.get('Trend_Zone', 'Unavailable')}"
+    )
+
 
 # =========================================================
 # MAIN PROGRAM
@@ -4380,6 +5366,14 @@ def main() -> None:
         print(
             "MPL chart:  "
             f"{Path(MPLFINANCE_OUTPUT_FILE).resolve()}"
+        )
+        print(
+            "Backtest:   "
+            f"{Path(BACKTEST_OUTPUT_FILE).resolve()}"
+        )
+        print(
+            "Trades:     "
+            f"{Path(BACKTEST_TRADES_FILE).resolve()}"
         )
 
         last_candle_time = pd.Timestamp(
