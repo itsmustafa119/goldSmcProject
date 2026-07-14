@@ -1,7 +1,9 @@
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
+import atexit
 import json
+import msvcrt
 import threading
 import time
 import webbrowser
@@ -48,9 +50,10 @@ SESSION_COLORS = {
     "New York": "rgba(255, 155, 45, 0.07)",
 }
 
-# Limit visible active zones to keep the chart clean.
-MAX_FVG_ZONES = 16
-MAX_OB_ZONES = 10
+# Cover every zone in the default three-day view while keeping the
+# much longer "All" view responsive.
+MAX_FVG_ZONES = 64
+MAX_OB_ZONES = 24
 MAX_LIQUIDITY_LEVELS = 6
 MAX_SWING_MARKERS = 40
 
@@ -78,6 +81,7 @@ LIVE_MODE = True
 LIVE_REFRESH_SECONDS = 5
 LIVE_HOST = "127.0.0.1"
 LIVE_PORT = 8765
+INSTANCE_LOCK_FILE = ".gold_smc.lock"
 
 LIVE_STATE = {
     "version": 0,
@@ -87,6 +91,53 @@ LIVE_STATE = {
     "error": None,
 }
 LIVE_STATE_LOCK = threading.Lock()
+
+
+def release_instance_lock(lock_file) -> None:
+    """Release the Windows process lock when Python exits."""
+
+    try:
+        lock_file.seek(0)
+        msvcrt.locking(
+            lock_file.fileno(),
+            msvcrt.LK_UNLCK,
+            1,
+        )
+    except (OSError, ValueError):
+        pass
+
+    lock_file.close()
+
+
+def acquire_instance_lock():
+    """Return a held lock, or None when the dashboard already runs."""
+
+    lock_path = Path(
+        INSTANCE_LOCK_FILE
+    ).resolve()
+    lock_file = lock_path.open("a+b")
+
+    if lock_path.stat().st_size == 0:
+        lock_file.write(b"1")
+        lock_file.flush()
+
+    lock_file.seek(0)
+
+    try:
+        msvcrt.locking(
+            lock_file.fileno(),
+            msvcrt.LK_NBLCK,
+            1,
+        )
+    except OSError:
+        lock_file.close()
+        return None
+
+    atexit.register(
+        release_instance_lock,
+        lock_file,
+    )
+    return lock_file
 
 
 # =========================================================
@@ -462,7 +513,7 @@ def calculate_smc_indicators(
 def validate_indicator_results(
     results: pd.DataFrame,
 ) -> None:
-    """Fail clearly if the upstream SMC API shape changes."""
+    """Fail clearly if indicator output is shifted or malformed."""
 
     expected_columns = {
         "Swing_HighLow",
@@ -564,6 +615,162 @@ def validate_indicator_results(
                 f"{sorted(unexpected)}"
             )
 
+    times = pd.to_datetime(results["time"])
+
+    if not times.is_monotonic_increasing or times.duplicated().any():
+        raise ValueError(
+            "Candle times must be unique and increasing before indicators "
+            "can be positioned accurately."
+        )
+
+    invalid_ohlc = (
+        results["high"]
+        < results[["open", "close"]].max(axis=1)
+    ) | (
+        results["low"]
+        > results[["open", "close"]].min(axis=1)
+    ) | (results["high"] < results["low"])
+
+    if invalid_ohlc.any():
+        raise ValueError(
+            "Invalid OHLC geometry would make indicator levels inaccurate."
+        )
+
+    for prefix, signal_column in [
+        ("FVG", "FVG_FVG"),
+        ("OB", "OB_OB"),
+    ]:
+        rows = results[signal_column].fillna(0).ne(0)
+        invalid_zone = rows & (
+            results[f"{prefix}_Top"].isna()
+            | results[f"{prefix}_Bottom"].isna()
+            | (
+                results[f"{prefix}_Top"]
+                <= results[f"{prefix}_Bottom"]
+            )
+        )
+
+        if invalid_zone.any():
+            raise ValueError(
+                f"Invalid {prefix} zone geometry at rows "
+                f"{results.index[invalid_zone].tolist()[:5]}"
+            )
+
+    fvg_rows = results.index[
+        results["FVG_FVG"].fillna(0).ne(0)
+    ]
+
+    for index in fvg_rows:
+        if index <= 0 or index >= len(results) - 1:
+            raise ValueError(
+                f"FVG at row {index} lacks its three-candle pattern."
+            )
+
+        direction = float(results.at[index, "FVG_FVG"])
+
+        if direction == 1:
+            expected_top = float(results.at[index + 1, "low"])
+            expected_bottom = float(results.at[index - 1, "high"])
+        else:
+            expected_top = float(results.at[index - 1, "low"])
+            expected_bottom = float(results.at[index + 1, "high"])
+
+        actual_top = float(results.at[index, "FVG_Top"])
+        actual_bottom = float(results.at[index, "FVG_Bottom"])
+
+        if not (
+            abs(actual_top - expected_top) <= 1e-6
+            and abs(actual_bottom - expected_bottom) <= 1e-6
+        ):
+            raise ValueError(
+                f"FVG output is shifted from its OHLC candles at row {index}."
+            )
+
+    index_columns = [
+        "FVG_MitigatedIndex",
+        "Structure_BrokenIndex",
+        "Liquidity_End",
+        "Liquidity_Swept",
+        "OB_MitigatedIndex",
+        "Trend_RangeStartIndex",
+    ]
+
+    for column in index_columns:
+        values = pd.to_numeric(
+            results[column],
+            errors="coerce",
+        ).dropna()
+        invalid = values[
+            (values < 0)
+            | (values > len(results) - 1)
+            | (values.mod(1) != 0)
+        ]
+
+        if not invalid.empty:
+            raise ValueError(
+                f"Invalid candle indices in {column}: "
+                f"{invalid.head().tolist()}"
+            )
+
+    lifecycle_specs = [
+        ("FVG_FVG", "FVG_MitigatedIndex", 2),
+        ("Structure_Level", "Structure_BrokenIndex", 1),
+        ("OB_OB", "OB_MitigatedIndex", 1),
+    ]
+
+    for signal_column, end_column, minimum_offset in lifecycle_specs:
+        signal_rows = results[signal_column].notna()
+
+        if signal_column != "Structure_Level":
+            signal_rows &= results[signal_column].fillna(0).ne(0)
+
+        end_values = pd.to_numeric(
+            results[end_column],
+            errors="coerce",
+        ).fillna(0)
+        source_positions = pd.Series(
+            range(len(results)),
+            index=results.index,
+        )
+        invalid_lifecycle = (
+            signal_rows
+            & end_values.gt(0)
+            & end_values.lt(source_positions + minimum_offset)
+        )
+
+        if invalid_lifecycle.any():
+            raise ValueError(
+                f"{end_column} precedes indicator formation at rows "
+                f"{results.index[invalid_lifecycle].tolist()[:5]}"
+            )
+
+    liquidity_rows = results["Liquidity_Liquidity"].fillna(0).ne(0)
+    liquidity_end = pd.to_numeric(
+        results["Liquidity_End"],
+        errors="coerce",
+    ).fillna(0)
+    liquidity_swept = pd.to_numeric(
+        results["Liquidity_Swept"],
+        errors="coerce",
+    ).fillna(0)
+    source_positions = pd.Series(
+        range(len(results)),
+        index=results.index,
+    )
+    invalid_liquidity = liquidity_rows & (
+        liquidity_end.le(source_positions)
+        | (
+            liquidity_swept.gt(0)
+            & liquidity_swept.le(liquidity_end)
+        )
+    )
+
+    if invalid_liquidity.any():
+        raise ValueError(
+            "Liquidity formation/sweep indices are out of order at rows "
+            f"{results.index[invalid_liquidity].tolist()[:5]}"
+        )
+
 
 # =========================================================
 # HELPER FUNCTIONS
@@ -588,14 +795,16 @@ def get_index_time(
     data: pd.DataFrame,
     index_value,
     default_time,
+    *,
+    offset: int = 0,
 ):
-    """Convert an indicator candle index to candle time."""
+    """Convert an indicator position to candle time safely."""
 
     if pd.isna(index_value):
         return default_time
 
     try:
-        candle_index = int(index_value)
+        candle_index = int(index_value) + offset
     except (TypeError, ValueError):
         return default_time
 
@@ -603,6 +812,28 @@ def get_index_time(
         return data.iloc[candle_index]["time"]
 
     return default_time
+
+
+def candle_edge_time(
+    candle_time,
+    *,
+    edge: str,
+):
+    """Return the visual left or right edge of an M15 candle."""
+
+    half_candle = pd.Timedelta(
+        minutes=TIMEFRAME_MINUTES / 2,
+    )
+
+    if edge == "left":
+        return candle_time - half_candle
+
+    if edge == "right":
+        return candle_time + half_candle
+
+    raise ValueError(
+        f"Unsupported candle edge: {edge}"
+    )
 
 
 def latest_value(
@@ -1130,10 +1361,13 @@ def add_session_regions(
     for _, session_rows in data[active].groupby(
         groups[active]
     ):
-        start_time = session_rows["time"].iloc[0]
-        end_time = (
-            session_rows["time"].iloc[-1]
-            + pd.Timedelta(minutes=TIMEFRAME_MINUTES)
+        start_time = candle_edge_time(
+            session_rows["time"].iloc[0],
+            edge="left",
+        )
+        end_time = candle_edge_time(
+            session_rows["time"].iloc[-1],
+            edge="right",
         )
 
         session_high = float(
@@ -1480,8 +1714,9 @@ def select_chart_zones(
     current_price: float,
     first_time,
     maximum_zones: int,
+    formation_offset: int = 0,
 ) -> pd.DataFrame:
-    """Select nearby active zones plus recently mitigated zones."""
+    """Select zones and resolve their exact candle lifetimes."""
 
     required_columns = {
         signal_column,
@@ -1522,6 +1757,13 @@ def select_chart_zones(
         )
 
     zones["_active"] = mitigation.le(0)
+    zones["_source_index"] = zones.index.astype(int)
+    zones["_start_index"] = (
+        zones["_source_index"] + formation_offset
+    ).clip(
+        lower=0,
+        upper=len(data) - 1,
+    )
     zones["_end_index"] = mitigation.where(
         mitigation.gt(0),
         len(data) - 1,
@@ -1530,10 +1772,32 @@ def select_chart_zones(
         upper=len(data) - 1,
     ).astype(int)
 
-    zones["_end_time"] = zones[
-        "_end_index"
+    candle_times = data["time"].reset_index(drop=True)
+
+    zones["_formation_time"] = zones[
+        "_start_index"
+    ].map(candle_times)
+
+    zones["_start_time"] = zones[
+        "_formation_time"
     ].map(
-        data["time"].reset_index(drop=True)
+        lambda value: candle_edge_time(
+            value,
+            edge="left",
+        )
+    )
+
+    zones["_end_candle_time"] = zones[
+        "_end_index"
+    ].map(candle_times)
+
+    zones["_end_time"] = zones[
+        "_end_candle_time"
+    ].map(
+        lambda value: candle_edge_time(
+            value,
+            edge="right",
+        )
     )
 
     zones = zones[
@@ -1543,15 +1807,10 @@ def select_chart_zones(
     if zones.empty:
         return zones
 
-    active_limit = max(
-        1,
-        maximum_zones // 2,
-    )
-
     active = zones[
         zones["_active"]
     ].nsmallest(
-        active_limit,
+        maximum_zones,
         "_distance",
     )
 
@@ -1632,6 +1891,7 @@ def add_zone_trace(
     show_legend: bool,
     display_text: str | None = None,
     details: str = "",
+    created_time=None,
 ) -> None:
     """
     Draw a zone without permanent text.
@@ -1663,6 +1923,9 @@ def add_zone_trace(
 
     if display_text is not None:
         short_label = display_text
+
+    if created_time is None:
+        created_time = start_time
 
     fig.add_trace(
         go.Scatter(
@@ -1696,7 +1959,7 @@ def add_zone_trace(
                 f"Top: {top:.2f}<br>"
                 f"Bottom: {bottom:.2f}<br>"
                 f"Size: {top - bottom:.2f}<br>"
-                f"Created: {start_time}<br>"
+                f"Created: {created_time}<br>"
                 f"{details}"
                 "<extra></extra>"
             ),
@@ -1976,16 +2239,53 @@ def add_previous_level_segments(
     fig: go.Figure,
     data: pd.DataFrame,
 ) -> None:
-    """Draw historical previous four-hour highs and lows."""
+    """Draw each previous-period level only in its valid period."""
 
     definitions = [
-        ("FourHour_PreviousHigh", "PH", "#a9b4bf"),
-        ("FourHour_PreviousLow", "PL", "#7f8b97"),
+        (
+            "Daily_PreviousHigh",
+            "PDH",
+            "#00e5ff",
+            "previous_daily",
+            1.8,
+            0.78,
+        ),
+        (
+            "Daily_PreviousLow",
+            "PDL",
+            "#ff55eb",
+            "previous_daily",
+            1.8,
+            0.78,
+        ),
+        (
+            "FourHour_PreviousHigh",
+            "P4H",
+            "#a9b4bf",
+            "previous_4h",
+            1.25,
+            0.58,
+        ),
+        (
+            "FourHour_PreviousLow",
+            "P4L",
+            "#7f8b97",
+            "previous_4h",
+            1.25,
+            0.58,
+        ),
     ]
 
-    show_legend = True
+    shown_groups = set()
 
-    for column, label, color in definitions:
+    for (
+        column,
+        label,
+        color,
+        legend_group,
+        line_width,
+        opacity,
+    ) in definitions:
         if column not in data.columns:
             continue
 
@@ -1996,10 +2296,13 @@ def add_previous_level_segments(
             values.notna()
         ].groupby(groups[values.notna()]):
             level = float(rows[column].iloc[0])
-            start_time = rows["time"].iloc[0]
-            end_time = (
-                rows["time"].iloc[-1]
-                + pd.Timedelta(minutes=TIMEFRAME_MINUTES)
+            start_time = candle_edge_time(
+                rows["time"].iloc[0],
+                edge="left",
+            )
+            end_time = candle_edge_time(
+                rows["time"].iloc[-1],
+                edge="right",
             )
 
             fig.add_trace(
@@ -2019,13 +2322,17 @@ def add_previous_level_segments(
                     },
                     line={
                         "color": color,
-                        "width": 1.25,
+                    "width": line_width,
                         "dash": "dot",
                     },
-                    opacity=0.58,
-                    name="Previous 4H Levels",
-                    legendgroup="previous_4h",
-                    showlegend=show_legend,
+                    opacity=opacity,
+                    name=(
+                        "Previous Daily Levels"
+                        if legend_group == "previous_daily"
+                        else "Previous 4H Levels"
+                    ),
+                    legendgroup=legend_group,
+                    showlegend=legend_group not in shown_groups,
                     hovertemplate=(
                         f"<b>{label}</b><br>"
                         f"Level: {level:.2f}"
@@ -2034,7 +2341,7 @@ def add_previous_level_segments(
                 )
             )
 
-            show_legend = False
+            shown_groups.add(legend_group)
 
 
 def add_retracement_annotations(
@@ -2324,6 +2631,7 @@ def create_mplfinance_snapshot(
             "bull": "#00dc79",
             "bear": "#ff4d5b",
             "hatch": None,
+            "formation_offset": 1,
         },
         {
             "signal": "OB_OB",
@@ -2335,6 +2643,7 @@ def create_mplfinance_snapshot(
             "bull": "#5d9cff",
             "bear": "#ff9b2d",
             "hatch": "///",
+            "formation_offset": 0,
         },
     ]
 
@@ -2348,6 +2657,7 @@ def create_mplfinance_snapshot(
             current_price=current_price,
             first_time=first_time,
             maximum_zones=spec["maximum"],
+            formation_offset=spec["formation_offset"],
         )
 
         for source_index, row in zones.iterrows():
@@ -2359,7 +2669,10 @@ def create_mplfinance_snapshot(
                 if active_zone
                 else int(row["_end_index"])
             )
-            x_start = max(float(source_index - first_index) - 0.42, -0.5)
+            x_start = max(
+                float(row["_start_index"] - first_index) - 0.42,
+                -0.5,
+            )
             x_end = min(float(end_index - first_index) + 0.42, candle_total - 0.5)
             bottom = float(row[spec["bottom"]])
             top = float(row[spec["top"]])
@@ -2390,13 +2703,16 @@ def create_mplfinance_snapshot(
                 )
             )
 
-            if x_start >= -0.5 and x_end - x_start >= 7:
+            if (
+                active_zone
+                and x_start >= -0.5
+                and x_end - x_start >= 7
+            ):
                 direction = "UP" if bullish else "DOWN"
-                status = "" if active_zone else " filled"
                 price_axis.text(
                     x_start + 0.8,
                     top,
-                    f"{spec['name']} {direction}{status}",
+                    f"{spec['name']} {direction}",
                     color=to_rgba(zone_color, 0.95),
                     fontsize=6.8,
                     fontweight="bold",
@@ -2598,37 +2914,47 @@ def create_mplfinance_snapshot(
             zorder=4.0,
         )
 
-    for column, label, color in [
-        ("Daily_PreviousHigh", "PDH", "#00e5ff"),
-        ("Daily_PreviousLow", "PDL", "#ff55eb"),
-        ("FourHour_PreviousHigh", "P4H", "#aeb8c2"),
-        ("FourHour_PreviousLow", "P4L", "#7f8b97"),
+    for column, label, color, alpha in [
+        ("Daily_PreviousHigh", "PDH", "#00e5ff", 0.78),
+        ("Daily_PreviousLow", "PDL", "#ff55eb", 0.78),
+        ("FourHour_PreviousHigh", "P4H", "#aeb8c2", 0.58),
+        ("FourHour_PreviousLow", "P4L", "#7f8b97", 0.58),
     ]:
-        value = latest_value(chart_data, column)
-
-        if value is None or pd.isna(value):
+        if column not in chart_data.columns:
             continue
 
-        level = float(value)
-        price_axis.axhline(
-            level,
-            color=color,
-            linewidth=0.9,
-            linestyle=(0, (6, 4)),
-            alpha=0.72,
-            zorder=1.8,
-        )
-        price_axis.text(
-            candle_total - 1.0,
-            level,
-            f"{label} {level:.2f}",
-            color=color,
-            fontsize=6.7,
-            ha="right",
-            va="bottom",
-            clip_on=True,
-            zorder=3.4,
-        )
+        values = chart_data[column]
+        groups = values.ne(values.shift()).cumsum()
+
+        for _, rows in chart_data[
+            values.notna()
+        ].groupby(groups[values.notna()]):
+            level = float(rows[column].iloc[0])
+            x_start = float(rows.index[0] - first_index) - 0.45
+            x_end = float(rows.index[-1] - first_index) + 0.45
+
+            price_axis.plot(
+                [x_start, x_end],
+                [level, level],
+                color=color,
+                linewidth=1.0 if label.startswith("PD") else 0.8,
+                linestyle=(0, (6, 4)),
+                alpha=alpha,
+                zorder=1.8,
+            )
+
+            if x_end >= candle_total - 1.5:
+                price_axis.text(
+                    min(x_end, candle_total - 0.6),
+                    level,
+                    f"{label} {level:.2f}",
+                    color=color,
+                    fontsize=6.7,
+                    ha="right",
+                    va="bottom",
+                    clip_on=True,
+                    zorder=3.4,
+                )
 
     price_axis.axhline(
         current_price,
@@ -2843,7 +3169,7 @@ def create_interactive_chart(
 ) -> Path:
     """Create a clean interactive SMC chart."""
 
-    data = results.copy()
+    data = results.copy().reset_index(drop=True)
 
     data["time"] = pd.to_datetime(
         data["time"]
@@ -2916,17 +3242,16 @@ def create_interactive_chart(
         current_price=current_price,
         first_time=first_time,
         maximum_zones=MAX_FVG_ZONES,
+        # smc.fvg stores the signal on candle two of the
+        # three-candle pattern. It is confirmed on candle three.
+        formation_offset=1,
     )
 
     for _, row in fvg_zones.iterrows():
 
         bullish = row["FVG_FVG"] == 1
         is_active = bool(row["_active"])
-        zone_end = (
-            last_time
-            if is_active
-            else row["_end_time"]
-        )
+        zone_end = row["_end_time"]
 
         if bullish:
             label = "Bullish FVG"
@@ -2965,15 +3290,15 @@ def create_interactive_chart(
         details = (
             "Status: Active<br>"
             if is_active
-            else f"Status: Mitigated<br>Filled: {zone_end}<br>"
+            else (
+                "Status: Mitigated<br>"
+                f"Filled: {row['_end_candle_time']}<br>"
+            )
         )
 
         add_zone_trace(
             fig=fig,
-            start_time=max(
-                row["time"],
-                first_time,
-            ),
+            start_time=max(row["_start_time"], first_time),
             end_time=zone_end,
             bottom=row["FVG_Bottom"],
             top=row["FVG_Top"],
@@ -2984,6 +3309,7 @@ def create_interactive_chart(
             show_legend=group not in shown_groups,
             display_text=display_text,
             details=details,
+            created_time=row["_formation_time"],
         )
 
         shown_groups.add(group)
@@ -3001,17 +3327,14 @@ def create_interactive_chart(
         current_price=current_price,
         first_time=first_time,
         maximum_zones=MAX_OB_ZONES,
+        formation_offset=0,
     )
 
     for _, row in order_block_zones.iterrows():
 
         bullish = row["OB_OB"] == 1
         is_active = bool(row["_active"])
-        zone_end = (
-            last_time
-            if is_active
-            else row["_end_time"]
-        )
+        zone_end = row["_end_time"]
 
         if bullish:
             label = "Bullish Order Block"
@@ -3061,16 +3384,16 @@ def create_interactive_chart(
             + (
                 "Status: Active<br>"
                 if is_active
-                else f"Status: Mitigated<br>Filled: {zone_end}<br>"
+                else (
+                    "Status: Mitigated<br>"
+                    f"Filled: {row['_end_candle_time']}<br>"
+                )
             )
         )
 
         add_zone_trace(
             fig=fig,
-            start_time=max(
-                row["time"],
-                first_time,
-            ),
+            start_time=max(row["_start_time"], first_time),
             end_time=zone_end,
             bottom=row["OB_Bottom"],
             top=row["OB_Top"],
@@ -3081,6 +3404,7 @@ def create_interactive_chart(
             show_legend=group not in shown_groups,
             display_text=display_text,
             details=details,
+            created_time=row["_formation_time"],
         )
 
         shown_groups.add(group)
@@ -3238,68 +3562,6 @@ def create_interactive_chart(
         fig=fig,
         data=chart_data,
     )
-
-    # -----------------------------------------------------
-    # PREVIOUS DAILY HIGH AND LOW
-    # -----------------------------------------------------
-
-    previous_high = latest_value(
-        chart_data,
-        "Daily_PreviousHigh",
-    )
-
-    previous_low = latest_value(
-        chart_data,
-        "Daily_PreviousLow",
-    )
-
-    if previous_high is not None:
-
-        previous_high = float(
-            previous_high
-        )
-
-        fig.add_hline(
-            y=previous_high,
-            line_color="#00e5ff",
-            line_width=2.5,
-            line_dash="dash",
-            annotation_text=(
-                f"PDH {previous_high:.2f}"
-            ),
-            annotation_position="top right",
-            annotation_font={
-                "color": "#00e5ff",
-                "size": 12,
-            },
-            annotation_bgcolor="rgba(16,18,21,0.88)",
-            annotation_bordercolor="#00e5ff",
-            annotation_borderpad=4,
-        )
-
-    if previous_low is not None:
-
-        previous_low = float(
-            previous_low
-        )
-
-        fig.add_hline(
-            y=previous_low,
-            line_color="#ff00e6",
-            line_width=2.5,
-            line_dash="dash",
-            annotation_text=(
-                f"PDL {previous_low:.2f}"
-            ),
-            annotation_position="bottom right",
-            annotation_font={
-                "color": "#ff55eb",
-                "size": 12,
-            },
-            annotation_bgcolor="rgba(16,18,21,0.88)",
-            annotation_bordercolor="#ff00e6",
-            annotation_borderpad=4,
-        )
 
     # -----------------------------------------------------
     # CURRENT PRICE
@@ -3529,7 +3791,7 @@ def create_interactive_chart(
         ],
         swings: ["swings"],
         trendmap: ["trendmap"],
-        levels: ["previous_4h"],
+        levels: ["previous_daily", "previous_4h"],
         sessions: ["session_London", "session_NewYork"],
         retracements: ["retracements"]
     };
@@ -5512,6 +5774,19 @@ def print_summary(
 # =========================================================
 
 def main() -> None:
+    instance_lock = acquire_instance_lock()
+
+    if instance_lock is None:
+        dashboard_url = f"http://{LIVE_HOST}:{LIVE_PORT}/"
+        print(
+            "The XAUUSD dashboard is already running.\n"
+            f"Opening {dashboard_url}"
+        )
+        webbrowser.open_new_tab(
+            dashboard_url
+        )
+        return
+
     print("Connecting to MetaTrader 5...")
 
     if not mt5.initialize():
