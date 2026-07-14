@@ -14,6 +14,7 @@ matplotlib.use("Agg")
 import pandas as pd
 import plotly.graph_objects as go
 import mplfinance as mpf
+from plotly.offline import get_plotlyjs
 from matplotlib import pyplot as plt
 from matplotlib.colors import to_rgba
 from matplotlib.lines import Line2D
@@ -55,6 +56,7 @@ MAX_SWING_MARKERS = 40
 
 CSV_OUTPUT_FILE = "xauusd_m15_smc_results.csv"
 HTML_OUTPUT_FILE = "xauusd_m15_smc_chart.html"
+PLOTLY_JS_FILE = "plotly.min.js"
 MPLFINANCE_OUTPUT_FILE = "xauusd_m15_smc_snapshot.png"
 MPLFINANCE_CANDLES = 300
 BACKTEST_OUTPUT_FILE = "xauusd_m15_smc_backtest.html"
@@ -2780,6 +2782,60 @@ def create_mplfinance_snapshot(
 # CREATE INTERACTIVE CHART
 # =========================================================
 
+def ensure_plotly_js_asset() -> Path:
+    """Create the reusable local Plotly runtime when it is missing."""
+
+    plotly_path = Path(
+        PLOTLY_JS_FILE
+    ).resolve()
+
+    if plotly_path.exists() and plotly_path.stat().st_size > 1_000_000:
+        return plotly_path
+
+    temporary_path = plotly_path.with_suffix(
+        ".tmp"
+    )
+    temporary_path.write_text(
+        get_plotlyjs(),
+        encoding="utf-8",
+    )
+    temporary_path.replace(
+        plotly_path
+    )
+
+    return plotly_path
+
+
+def defer_plotly_initialization(html: str) -> str:
+    """Start the heavy Plotly runtime after the page shell is visible."""
+
+    initializer = "window.PLOTLYENV=window.PLOTLYENV || {};"
+    initializer_index = html.find(initializer)
+
+    if initializer_index < 0:
+        raise RuntimeError(
+            "Could not locate the generated Plotly initialization script."
+        )
+
+    script_end = html.find(
+        "</script>",
+        initializer_index,
+    )
+
+    if script_end < 0:
+        raise RuntimeError(
+            "Could not locate the end of the Plotly initialization script."
+        )
+
+    return (
+        html[:initializer_index]
+        + 'window.addEventListener("smc-plotly-ready", () => {'
+        + html[initializer_index:script_end]
+        + "\n});\n"
+        + html[script_end:]
+    )
+
+
 def create_interactive_chart(
     results: pd.DataFrame,
     number_of_candles: int = 1200,
@@ -3422,6 +3478,8 @@ def create_interactive_chart(
 (() => {
     const plot = document.getElementById("smc-chart");
     const shell = document.getElementById("chart-shell");
+    const loadingOverlay = document.getElementById("chart-loading");
+    const previewImage = document.getElementById("chart-preview");
     const indicatorButton = document.getElementById("chart-indicators");
     const indicatorPanel = document.getElementById("indicator-panel");
     const closePanelButton = document.getElementById("close-indicators");
@@ -3936,6 +3994,8 @@ def create_interactive_chart(
     applyResponsiveLayout();
     setLabelsVisibility(labelsToggle?.checked ?? false);
     restoreChartView();
+    loadingOverlay?.setAttribute("hidden", "");
+    previewImage?.setAttribute("hidden", "");
     pollLiveStatus();
     window.setInterval(
         pollLiveStatus,
@@ -3968,13 +4028,44 @@ def create_interactive_chart(
         )
     )
 
+    ensure_plotly_js_asset()
+
     html = fig.to_html(
-        include_plotlyjs=True,
+        include_plotlyjs=False,
         full_html=True,
         config=chart_config,
         div_id="smc-chart",
         post_script=responsive_script,
     )
+    html = defer_plotly_initialization(
+        html
+    )
+
+    plotly_loader_script = f"""
+<script>
+    window.addEventListener("DOMContentLoaded", () => {{
+        const script = document.createElement("script");
+        script.src = "{PLOTLY_JS_FILE}";
+        script.onload = () => window.dispatchEvent(
+            new Event("smc-plotly-ready")
+        );
+        script.onerror = () => {{
+            const loading = document.getElementById("chart-loading");
+            const message = loading?.querySelector("strong");
+            const detail = loading?.querySelector("small");
+            const badge = document.getElementById("live-badge");
+
+            if (message) message.textContent = "Chart engine could not load";
+            if (detail) detail.textContent = "Restart the launcher and refresh this page.";
+            if (badge) {{
+                badge.dataset.state = "error";
+                badge.textContent = "Chart unavailable";
+            }}
+        }};
+        document.head.appendChild(script);
+    }});
+</script>
+"""
 
     responsive_styles = """
 <style>
@@ -4013,6 +4104,62 @@ def create_interactive_chart(
         width: 100% !important;
         height: 100% !important;
         min-height: 520px;
+    }
+
+    .chart-loading {
+        position: absolute;
+        z-index: 4;
+        inset: 300px 24px 72px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-direction: column;
+        gap: 10px;
+        color: #dce6ee;
+        text-align: center;
+        pointer-events: none;
+    }
+
+    .chart-preview {
+        position: absolute;
+        z-index: 1;
+        inset: 285px 0 54px;
+        width: 100%;
+        height: calc(100% - 339px);
+        object-fit: contain;
+        object-position: center;
+        opacity: .62;
+        pointer-events: none;
+    }
+
+    .chart-preview[hidden] {
+        display: none;
+    }
+
+    .chart-loading[hidden] {
+        display: none;
+    }
+
+    .chart-loading-spinner {
+        width: 30px;
+        height: 30px;
+        border: 3px solid #34404a;
+        border-top-color: #35d4b2;
+        border-radius: 50%;
+        animation: chart-loading-spin .8s linear infinite;
+    }
+
+    .chart-loading strong {
+        font-size: 14px;
+    }
+
+    .chart-loading small {
+        color: #8f9ca8;
+        font-size: 11px;
+    }
+
+    @keyframes chart-loading-spin {
+        to { transform: rotate(360deg); }
     }
 
     .chart-actions {
@@ -4622,13 +4769,17 @@ def create_interactive_chart(
         .chart-actions button:active {
             transform: none;
         }
+
+        .chart-loading-spinner {
+            animation: none;
+        }
     }
 </style>
 """
 
     chart_controls = """
 <main id="chart-shell">
-    <div id="live-badge" class="live-badge" data-state="static">Static snapshot</div>
+    <div id="live-badge" class="live-badge" data-state="static">Loading chart</div>
     <nav class="chart-actions" aria-label="Chart controls">
         <span class="toolbar-group">
             <button id="chart-indicators" class="primary-action" type="button" title="Organize indicators (I)" aria-expanded="false" aria-controls="indicator-panel">
@@ -4655,6 +4806,14 @@ def create_interactive_chart(
             <button id="chart-help-button" type="button" title="Chart help and shortcuts (H)">Help</button>
         </span>
     </nav>
+
+    <img id="chart-preview" class="chart-preview" src="__MPLFINANCE_OUTPUT_FILE__" alt="Latest generated XAUUSD chart preview">
+
+    <div id="chart-loading" class="chart-loading" role="status" aria-live="polite">
+        <span class="chart-loading-spinner" aria-hidden="true"></span>
+        <strong>Loading XAUUSD chart...</strong>
+        <small>The first load prepares the local chart engine.</small>
+    </div>
 
     <aside id="indicator-panel" class="indicator-panel" aria-label="Indicator controls" hidden>
         <header class="panel-header">
@@ -4766,9 +4925,16 @@ def create_interactive_chart(
     </dialog>
 """
 
-    chart_controls = chart_controls.replace(
-        "__STATUS_TEXT__",
-        status_text,
+    chart_controls = (
+        chart_controls
+        .replace(
+            "__STATUS_TEXT__",
+            status_text,
+        )
+        .replace(
+            "__MPLFINANCE_OUTPUT_FILE__",
+            MPLFINANCE_OUTPUT_FILE,
+        )
     )
 
     dashboard_html = build_analysis_dashboard(
@@ -4778,7 +4944,9 @@ def create_interactive_chart(
 
     html = html.replace(
         "</head>",
-        f"{responsive_styles}</head>",
+        (
+            f"{plotly_loader_script}{responsive_styles}</head>"
+        ),
     )
 
     html = html.replace(
@@ -5029,6 +5197,7 @@ class LiveDashboardRequestHandler(
         status_code: int,
         content_type: str,
         payload: bytes,
+        cache_control: str = "no-store, no-cache, must-revalidate",
     ) -> None:
         self.send_response(status_code)
         self.send_header(
@@ -5041,7 +5210,7 @@ class LiveDashboardRequestHandler(
         )
         self.send_header(
             "Cache-Control",
-            "no-store, no-cache, must-revalidate",
+            cache_control,
         )
         self.end_headers()
         self.wfile.write(payload)
@@ -5084,6 +5253,27 @@ class LiveDashboardRequestHandler(
             )
             return
 
+        if request_path == f"/{PLOTLY_JS_FILE}":
+            plotly_path = Path(
+                PLOTLY_JS_FILE
+            ).resolve()
+
+            if not plotly_path.exists():
+                self.send_bytes(
+                    503,
+                    "text/plain; charset=utf-8",
+                    b"The local Plotly runtime is still being generated.",
+                )
+                return
+
+            self.send_bytes(
+                200,
+                "application/javascript; charset=utf-8",
+                plotly_path.read_bytes(),
+                cache_control="public, max-age=86400",
+            )
+            return
+
         if request_path == "/mplfinance":
             self.send_bytes(
                 200,
@@ -5092,7 +5282,10 @@ class LiveDashboardRequestHandler(
             )
             return
 
-        if request_path == "/mplfinance.png":
+        if request_path in {
+            "/mplfinance.png",
+            f"/{MPLFINANCE_OUTPUT_FILE}",
+        }:
             snapshot_path = Path(
                 MPLFINANCE_OUTPUT_FILE
             ).resolve()
