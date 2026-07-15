@@ -1,4 +1,7 @@
 from pathlib import Path
+import atexit
+import msvcrt
+import threading
 
 SYMBOL = "XAUUSD"
 TIMEFRAME = None
@@ -16,10 +19,14 @@ SESSION_COLORS = {
     "New York": "rgba(255, 155, 45, 0.07)",
 }
 
-MAX_FVG_ZONES = 16
-MAX_OB_ZONES = 10
+# Expanded zone limits for comprehensive coverage
+MAX_FVG_ZONES = 64
+MAX_OB_ZONES = 24
 MAX_LIQUIDITY_LEVELS = 6
 MAX_SWING_MARKERS = 40
+
+# Windows process lock for preventing duplicate dashboard instances
+INSTANCE_LOCK_FILE = ".gold_smc.lock"
 
 CSV_OUTPUT_FILE = "xauusd_m15_smc_results.csv"
 HTML_OUTPUT_FILE = "xauusd_m15_smc_chart.html"
@@ -49,3 +56,50 @@ def project_path(filename: str | Path) -> Path:
 
     path = Path(filename)
     return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def release_instance_lock(lock_file) -> None:
+    """Release the Windows process lock when Python exits."""
+
+    try:
+        lock_file.seek(0)
+        msvcrt.locking(
+            lock_file.fileno(),
+            msvcrt.LK_UNLCK,
+            1,
+        )
+    except (OSError, ValueError):
+        pass
+
+    lock_file.close()
+
+
+def acquire_instance_lock():
+    """Return a held lock, or None when the dashboard already runs."""
+
+    lock_path = project_path(
+        INSTANCE_LOCK_FILE
+    ).resolve()
+    lock_file = lock_path.open("a+b")
+
+    if lock_path.stat().st_size == 0:
+        lock_file.write(b"1")
+        lock_file.flush()
+
+    lock_file.seek(0)
+
+    try:
+        msvcrt.locking(
+            lock_file.fileno(),
+            msvcrt.LK_NBLCK,
+            1,
+        )
+    except OSError:
+        lock_file.close()
+        return None
+
+    atexit.register(
+        release_instance_lock,
+        lock_file,
+    )
+    return lock_file

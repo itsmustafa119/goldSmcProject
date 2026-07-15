@@ -29,17 +29,33 @@ echo  XAUUSD M15 Smart Money Concepts - Live Dashboard
 echo ========================================================
 echo.
 echo Keep MetaTrader 5 open and logged in.
-echo The dashboard will open automatically in your browser.
-echo Press Ctrl+C in this window when you want to stop it.
+echo.
+echo Starting the analysis and launching your browser...
 echo.
 
+REM Run the Python script
 ".venv\Scripts\python.exe" "analyze_gold_mt5.py"
 
 set "EXIT_CODE=%ERRORLEVEL%"
 
-if not "%EXIT_CODE%"=="0" (
+if "%EXIT_CODE%"=="0" (
     echo.
-    echo The dashboard stopped with exit code %EXIT_CODE%.
+    echo Dashboard stopped normally. Please close this window.
+    timeout /t 3 /nobreak
+) else if "%EXIT_CODE%"=="1" (
+    echo.
+    echo Dashboard is already running (only one instance allowed at a time^).
+    echo.
+    echo To use the dashboard, stop the currently running instance first.
+    pause
+) else (
+    echo.
+    echo ERROR: The dashboard stopped unexpectedly ^(exit code %EXIT_CODE%^).
+    echo.
+    echo Please check:
+    echo - MetaTrader 5 is open and logged in
+    echo - Your internet connection is working
+    echo - No other instance is running
     pause
 )
 

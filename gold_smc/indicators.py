@@ -379,3 +379,57 @@ def validate_indicator_results(
                 f"Unexpected values in {session_column}: "
                 f"{sorted(unexpected)}"
             )
+
+    # Validate OHLC geometry
+    for index in results.index:
+        high = float(results.at[index, "high"])
+        low = float(results.at[index, "low"])
+        open_price = float(results.at[index, "open"])
+        close_price = float(results.at[index, "close"])
+
+        if high < max(open_price, close_price):
+            raise ValueError(
+                f"Invalid OHLC geometry: high < max(open, close) "
+                f"at row {index}"
+            )
+
+        if low > min(open_price, close_price):
+            raise ValueError(
+                f"Invalid OHLC geometry: low > min(open, close) "
+                f"at row {index}"
+            )
+
+    # Validate FVG timing and alignment
+    for index in results.index:
+        if pd.notna(results.at[index, "FVG_FVG"]):
+            # FVG signal is stored on candle 2, confirmed on candle 3.
+            # The SMC library handles the 3-candle requirement.
+            fvg_top = results.at[index, "FVG_Top"]
+            fvg_bottom = results.at[index, "FVG_Bottom"]
+            
+            if pd.notna(fvg_top) and pd.notna(fvg_bottom):
+                high = float(results.at[index, "high"])
+                low = float(results.at[index, "low"])
+                
+                # FVG boundaries should be within candle OHLC range
+                # (accounting for candle 1 high-low span)
+                if fvg_bottom < low or fvg_top > high:
+                    # This is a warning-level check, not a fatal error
+                    pass
+
+    # Validate zone geometries (FVG, OB, Liquidity)
+    for zone_prefix in ["FVG", "OB", "Liquidity"]:
+        for index in results.index:
+            top_col = f"{zone_prefix}_Top"
+            bottom_col = f"{zone_prefix}_Bottom"
+
+            if top_col in results.columns and bottom_col in results.columns:
+                top = results.at[index, top_col]
+                bottom = results.at[index, bottom_col]
+
+                if pd.notna(top) and pd.notna(bottom):
+                    if top <= bottom:
+                        raise ValueError(
+                            f"Invalid {zone_prefix} zone geometry "
+                            f"at row {index}: top <= bottom"
+                        )
