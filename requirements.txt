@@ -1,6 +1,6 @@
-MetaTrader5
-backtesting
-mplfinance
-pandas
-plotly
-smartmoneyconcepts
+MetaTrader5==5.0.5735
+backtesting==0.6.5
+mplfinance==0.12.10b0
+pandas==3.0.3
+plotly==6.9.0
+smartmoneyconcepts==0.0.27

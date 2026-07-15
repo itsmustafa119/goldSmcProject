@@ -63,6 +63,18 @@ Then:
 3. Keep the terminal window open while using the dashboard.
 4. Press `Ctrl+C` in that window to stop the application.
 
+Alternatively, you can start the application directly with Python from the project root:
+
+```powershell
+.venv\Scripts\python.exe analyze_gold_mt5.py
+```
+
+or:
+
+```powershell
+.venv\Scripts\python.exe -m gold_smc
+```
+
 The application opens the dashboard automatically. Its default address is:
 
 ```text
@@ -139,13 +151,23 @@ After changing a setting, stop and restart the launcher.
 
 ```text
 goldSmcProject/
-|-- analyze_gold_mt5.py   # MT5 data, indicators, charts, dashboard, and live server
+|-- analyze_gold_mt5.py   # Lightweight wrapper entrypoint for the package
+|-- gold_smc/             # Refactored reusable package
 |-- smc_backtest.py       # Causal strategy preparation and backtesting.py integration
 |-- start_gold_smc.bat    # One-click Windows launcher
 |-- requirements.txt      # Python dependencies
 |-- docs/
 |   `-- USAGE.md          # Simple installation and usage guide
+|-- tests/                # Unit tests for package helpers
 `-- xauusd_m15_smc_snapshot.png
+```
+
+## Running tests
+
+From the project root, run the unit tests with:
+
+```powershell
+.venv\Scripts\python.exe -m unittest discover -s tests -p 'test_*.py'
 ```
 
 ## Libraries used
