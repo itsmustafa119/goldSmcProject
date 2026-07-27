@@ -1,8 +1,12 @@
 .venv/
+.agents/
 __pycache__/
+.pytest_cache/
 *.pyc
-xauusd_m15_smc_results.csv
-xauusd_m15_smc_chart.html
-xauusd_m15_smc_backtest.html
-xauusd_m15_smc_trades.csv
+*.tmp
+*.log
+.coverage
+htmlcov/
+.gold_smc.lock
 plotly.min.js
+outputs/

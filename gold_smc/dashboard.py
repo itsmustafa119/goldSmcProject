@@ -8,8 +8,6 @@ import pandas as pd
 
 from .chart import build_mplfinance_viewer
 from .config import (
-    BACKTEST_OUTPUT_FILE,
-    BACKTEST_TRADES_FILE,
     HTML_OUTPUT_FILE,
     LIVE_HOST,
     LIVE_PORT,
@@ -167,52 +165,6 @@ class LiveDashboardRequestHandler(BaseHTTPRequestHandler):
                 200,
                 "image/png",
                 snapshot_path.read_bytes(),
-            )
-            return
-
-        if request_path in {
-            "/backtest",
-            f"/{BACKTEST_OUTPUT_FILE}",
-        }:
-            backtest_path = project_path(
-                BACKTEST_OUTPUT_FILE
-            ).resolve()
-
-            if not backtest_path.exists():
-                self.send_bytes(
-                    503,
-                    "text/plain; charset=utf-8",
-                    b"The backtest is still being generated.",
-                )
-                return
-
-            self.send_bytes(
-                200,
-                "text/html; charset=utf-8",
-                backtest_path.read_bytes(),
-            )
-            return
-
-        if request_path in {
-            "/backtest-trades.csv",
-            f"/{BACKTEST_TRADES_FILE}",
-        }:
-            trades_path = project_path(
-                BACKTEST_TRADES_FILE
-            ).resolve()
-
-            if not trades_path.exists():
-                self.send_bytes(
-                    503,
-                    "text/plain; charset=utf-8",
-                    b"The backtest trade list is still being generated.",
-                )
-                return
-
-            self.send_bytes(
-                200,
-                "text/csv; charset=utf-8",
-                trades_path.read_bytes(),
             )
             return
 

@@ -1,3 +1,4 @@
+from html import escape
 from pathlib import Path
 
 import pandas as pd
@@ -10,10 +11,7 @@ from matplotlib.patches import Patch, Rectangle
 from plotly.offline import get_plotlyjs
 
 from .config import (
-    BACKTEST_OUTPUT_FILE,
-    BACKTEST_TRADES_FILE,
     HTML_OUTPUT_FILE,
-    LIQUIDITY_RANGE,
     LIVE_REFRESH_SECONDS,
     MAX_FVG_ZONES,
     MAX_LIQUIDITY_LEVELS,
@@ -23,7 +21,6 @@ from .config import (
     MPLFINANCE_OUTPUT_FILE,
     PLOTLY_JS_FILE,
     SESSION_COLORS,
-    SESSION_TIME_ZONE,
     SYMBOL,
     TIMEFRAME_MINUTES,
     TIMEFRAME_NAME,
@@ -155,143 +152,13 @@ def retracement_status(
     )
 
     return (
-        f"{direction} Â· Retracement {current:.1f}% "
-        f"Â· Deepest {deepest:.1f}%"
+        f"{direction} · Retracement {current:.1f}% "
+        f"· Deepest {deepest:.1f}%"
     )
-
-
-def build_backtest_dashboard(
-    summary: dict | None,
-) -> str:
-    """Build backtest metrics, assumptions, and recent trades."""
-
-    if not summary:
-        return """
-<section class="backtest-dashboard" aria-labelledby="backtest-title">
-    <header class="reference-header">
-        <p class="eyebrow">Historical strategy simulation</p>
-        <h2 id="backtest-title">Backtest unavailable</h2>
-        <p>The backtest did not produce a result during this refresh.</p>
-    </header>
-</section>
-"""
-
-    def metric(
-        key: str,
-        *,
-        suffix: str = "",
-        decimals: int = 2,
-        money: bool = False,
-    ) -> str:
-        value = summary.get(key)
-
-        if value is None or pd.isna(value):
-            return "â€”"
-
-        if money:
-            return f"${float(value):,.2f}"
-
-        return f"{float(value):,.{decimals}f}{suffix}"
-
-    trade_rows = []
-
-    for trade in summary.get("recent_trades", []):
-        outcome_class = (
-            "trade-win"
-            if trade["outcome"] == "Win"
-            else "trade-loss"
-            if trade["outcome"] == "Loss"
-            else ""
-        )
-        trade_rows.append(
-            "<tr>"
-            f"<td>{trade['direction']}</td>"
-            f"<td>{trade['entry_time']}</td>"
-            f"<td>{trade['exit_time']}</td>"
-            f"<td>{trade['entry_price']:,.2f}</td>"
-            f"<td>{trade['exit_price']:,.2f}</td>"
-            f"<td class=\"{outcome_class}\">{trade['pnl']:,.2f}</td>"
-            f"<td class=\"{outcome_class}\">{trade['return_pct']:,.2f}%</td>"
-            "</tr>"
-        )
-
-    table_body = (
-        "".join(trade_rows)
-        if trade_rows
-        else "<tr><td colspan=\"7\">No completed trades for this rule set.</td></tr>"
-    )
-
-    leverage = (
-        1 / float(summary["margin"])
-        if float(summary.get("margin", 0)) > 0
-        else 1
-    )
-
-    return f"""
-<section class="backtest-dashboard" aria-labelledby="backtest-title">
-    <header class="dashboard-header">
-        <div>
-            <p class="eyebrow">Historical strategy simulation</p>
-            <h2 id="backtest-title">SMC pullback backtest</h2>
-            <p>{summary['start']} to {summary['end']} Â· Confirmed trend + structure bias + discount/premium pullback Â· ATR stop Â· {summary['risk_reward']:.1f}R target.</p>
-        </div>
-        <div class="backtest-links">
-            <a class="back-to-chart" href="{BACKTEST_OUTPUT_FILE}" target="_blank" rel="noopener">Interactive results</a>
-            <a class="back-to-chart" href="{BACKTEST_TRADES_FILE}" download>Trade CSV</a>
-        </div>
-    </header>
-
-    <div class="metric-grid backtest-metrics">
-        <article class="metric-card metric-primary">
-            <span>Strategy return</span>
-            <strong>{metric('return_pct', suffix='%')}</strong>
-            <small>Buy &amp; hold {metric('buy_hold_return_pct', suffix='%')}</small>
-        </article>
-        <article class="metric-card">
-            <span>Completed trades</span>
-            <strong>{summary['trades']}</strong>
-            <small>{summary['long_setups']} long Â· {summary['short_setups']} short setups</small>
-        </article>
-        <article class="metric-card">
-            <span>Win rate</span>
-            <strong>{metric('win_rate_pct', suffix='%')}</strong>
-            <small>Expectancy {metric('expectancy_pct', suffix='%')}</small>
-        </article>
-        <article class="metric-card">
-            <span>Maximum drawdown</span>
-            <strong>{metric('max_drawdown_pct', suffix='%')}</strong>
-            <small>Profit factor {metric('profit_factor')}</small>
-        </article>
-        <article class="metric-card">
-            <span>Final equity</span>
-            <strong>{metric('equity_final', money=True)}</strong>
-            <small>Starting cash ${summary['cash']:,.0f}</small>
-        </article>
-        <article class="metric-card metric-wide">
-            <span>Execution assumptions</span>
-            <strong>{summary['position_fraction'] * 100:.0f}% liquidity per trade Â· {leverage:.0f}:1 leverage</strong>
-            <small>{summary['spread'] * 10_000:.1f} bp spread Â· close-bar fills Â· {summary['atr_multiplier']:.1f} ATR minimum stop Â· pivots delayed {summary['swing_confirmation_bars']} candles</small>
-        </article>
-    </div>
-
-    <div class="trade-table-wrap">
-        <table class="trade-table">
-            <caption>Most recent completed trades</caption>
-            <thead>
-                <tr><th>Side</th><th>Entry</th><th>Exit</th><th>Entry price</th><th>Exit price</th><th>P&amp;L</th><th>Return</th></tr>
-            </thead>
-            <tbody>{table_body}</tbody>
-        </table>
-    </div>
-
-    <p class="analysis-disclaimer">Hypothetical historical simulation onlyâ€”not a forecast or trading recommendation. Results omit slippage beyond the configured spread, financing, broker-specific contract sizing, news restrictions, and execution failures. Parameters were not optimized on this sample.</p>
-</section>
-"""
 
 
 def build_analysis_dashboard(
     data: pd.DataFrame,
-    backtest_summary: dict | None = None,
 ) -> str:
     """Build summary metrics and an indicator reference section."""
 
@@ -301,7 +168,7 @@ def build_analysis_dashboard(
         value = latest_value(data, column)
 
         if value is None or pd.isna(value):
-            return "â€”"
+            return "—"
 
         return f"{float(value):,.2f}"
 
@@ -370,8 +237,8 @@ def build_analysis_dashboard(
             )
 
             latest_structure = (
-                f"{direction_name} {structure_name} Â· "
-                f"{float(structure_row['Structure_Level']):,.2f} Â· "
+                f"{direction_name} {structure_name} · "
+                f"{float(structure_row['Structure_Level']):,.2f} · "
                 f"{break_time}"
             )
 
@@ -426,25 +293,21 @@ def build_analysis_dashboard(
     support_text = (
         f"{nearest_support:,.2f}"
         if nearest_support is not None
-        else "â€”"
+        else "—"
     )
     resistance_text = (
         f"{nearest_resistance:,.2f}"
         if nearest_resistance is not None
-        else "â€”"
-    )
-
-    backtest_html = build_backtest_dashboard(
-        backtest_summary
+        else "—"
     )
 
     return f"""
 <section id="chart-summary" class="analysis-dashboard" aria-labelledby="summary-title">
     <header class="dashboard-header">
         <div>
-            <p class="eyebrow">XAUUSD {TIMEFRAME_NAME} analysis</p>
+            <p class="eyebrow">{SYMBOL} {TIMEFRAME_NAME} analysis</p>
             <h2 id="summary-title">Market summary</h2>
-            <p>Latest completed candle: {latest['time']} Â· Indicators use completed candles to avoid intrabar repainting.</p>
+            <p>Latest completed candle: {latest['time']} · Indicators use completed candles to avoid intrabar repainting.</p>
         </div>
         <a class="back-to-chart" href="#chart-shell">Back to chart</a>
     </header>
@@ -453,7 +316,7 @@ def build_analysis_dashboard(
         <article class="metric-card metric-primary">
             <span>Live / latest price</span>
             <strong id="live-current-price">{float(latest['close']):,.2f}</strong>
-            <small>O {float(latest['open']):,.2f} Â· H {float(latest['high']):,.2f} Â· L {float(latest['low']):,.2f} Â· C {float(latest['close']):,.2f}</small>
+            <small>O {float(latest['open']):,.2f} · H {float(latest['high']):,.2f} · L {float(latest['low']):,.2f} · C {float(latest['close']):,.2f}</small>
         </article>
         <article class="metric-card">
             <span>Previous day</span>
@@ -467,18 +330,18 @@ def build_analysis_dashboard(
         </article>
         <article class="metric-card">
             <span>Active zones</span>
-            <strong>{fvg_count} FVG Â· {ob_count} OB</strong>
+            <strong>{fvg_count} FVG · {ob_count} OB</strong>
             <small>{liquidity_count} unswept liquidity pools</small>
         </article>
         <article class="metric-card">
             <span>Swing trend</span>
             <strong>{trend_state}</strong>
-            <small>HH/HL confirms uptrend Â· LH/LL confirms downtrend</small>
+            <small>HH/HL confirms uptrend · LH/LL confirms downtrend</small>
         </article>
         <article class="metric-card">
             <span>Dealing range</span>
             <strong>{dealing_zone}</strong>
-            <small>Support {support_text} Â· Resistance {resistance_text}</small>
+            <small>Support {support_text} · Resistance {resistance_text}</small>
         </article>
         <article class="metric-card metric-wide">
             <span>Latest confirmed structure</span>
@@ -552,7 +415,6 @@ def build_analysis_dashboard(
 
     <p class="analysis-disclaimer">Educational analysis only. SMC labels are algorithmic interpretations and should not be used as the sole basis for a trade.</p>
 </section>
-{backtest_html}
 """
 
 
@@ -1112,10 +974,10 @@ def add_zone_trace(
         return
 
     short_labels = {
-        "Bullish FVG": "FVG â–²",
-        "Bearish FVG": "FVG â–¼",
-        "Bullish Order Block": "OB â–²",
-        "Bearish Order Block": "OB â–¼",
+        "Bullish FVG": "FVG ▲",
+        "Bearish FVG": "FVG ▼",
+        "Bullish Order Block": "OB ▲",
+        "Bearish Order Block": "OB ▼",
     }
 
     short_label = short_labels.get(
@@ -1572,6 +1434,288 @@ def add_retracement_annotations(
             hoverinfo="text",
         )
     )
+
+
+def add_backtest_trade_overlays(
+    fig: go.Figure,
+    trades: pd.DataFrame | None,
+    *,
+    first_time,
+    last_time,
+) -> None:
+    """Draw all audited trades with a small, fixed number of traces."""
+
+    if trades is None or trades.empty:
+        return
+
+    visible = trades.copy()
+    visible["EntryTime"] = pd.to_datetime(visible["EntryTime"])
+    visible["ExitTime"] = pd.to_datetime(visible["ExitTime"])
+    visible = visible[
+        visible["ExitTime"].ge(first_time)
+        & visible["EntryTime"].le(last_time)
+    ]
+
+    outcome_colors = {
+        "Win": "#27e1b5",
+        "Loss": "#ff6978",
+        "Flat": "#a9b4bf",
+    }
+    path_groups = {
+        outcome: {
+            "x": [],
+            "y": [],
+            "hover": [],
+        }
+        for outcome in outcome_colors
+    }
+    entry_groups = {
+        "Long": {
+            "x": [],
+            "y": [],
+            "text": [],
+            "hover": [],
+            "color": "#27e1b5",
+            "symbol": "triangle-up",
+        },
+        "Short": {
+            "x": [],
+            "y": [],
+            "text": [],
+            "hover": [],
+            "color": "#ff6978",
+            "symbol": "triangle-down",
+        },
+    }
+    exit_groups = {
+        outcome: {
+            "x": [],
+            "y": [],
+            "text": [],
+            "hover": [],
+        }
+        for outcome in outcome_colors
+    }
+    stop_lines = {
+        "x": [],
+        "y": [],
+        "hover": [],
+    }
+    target_lines = {
+        "x": [],
+        "y": [],
+        "hover": [],
+    }
+
+    def append_segment(group, start, end, level, hover_text) -> None:
+        group["x"].extend([start, end, None])
+        group["y"].extend([level, level, None])
+        group["hover"].extend([hover_text, hover_text, None])
+
+    for _, trade in visible.iterrows():
+        trade_number = int(trade.get("Trade", 0))
+        direction = str(trade["Direction"])
+        outcome = str(trade.get("Outcome", "Flat"))
+        outcome = outcome if outcome in outcome_colors else "Flat"
+        original_entry_time = pd.Timestamp(trade["EntryTime"])
+        original_exit_time = pd.Timestamp(trade["ExitTime"])
+        entry_time = max(original_entry_time, first_time)
+        exit_time = min(original_exit_time, last_time)
+        entry_price = float(trade["EntryPrice"])
+        exit_price = float(trade["ExitPrice"])
+        stop = trade.get("InitialSL")
+        target = trade.get("InitialTP")
+        pnl = float(trade.get("PnL", 0.0))
+        return_pct = float(trade.get("ReturnPct", 0.0)) * 100
+        reason = escape(str(trade.get("SignalReason", "")))
+        context = escape(str(trade.get("IndicatorContext", "")))
+        exit_reason = escape(str(trade.get("ExitReason", "")))
+        common_details = (
+            f"<b>Trade #{trade_number} · {direction}</b><br>"
+            f"Entry: {entry_price:,.2f}<br>"
+            f"Exit: {exit_price:,.2f}<br>"
+            f"P&amp;L: {pnl:,.2f} ({return_pct:,.2f}%)<br>"
+            f"Rule: {reason}<br>"
+            f"Indicators: {context}<br>"
+            f"Exit: {exit_reason}"
+        )
+
+        path_group = path_groups[outcome]
+        path_group["x"].extend([entry_time, exit_time, None])
+        path_group["y"].extend([entry_price, exit_price, None])
+        path_group["hover"].extend(
+            [common_details, common_details, None]
+        )
+
+        if pd.notna(stop):
+            stop = float(stop)
+            append_segment(
+                stop_lines,
+                entry_time,
+                exit_time,
+                stop,
+                (
+                    f"<b>Trade #{trade_number} initial SL</b><br>"
+                    f"{stop:,.2f}"
+                ),
+            )
+
+        if pd.notna(target):
+            target = float(target)
+            append_segment(
+                target_lines,
+                entry_time,
+                exit_time,
+                target,
+                (
+                    f"<b>Trade #{trade_number} initial TP</b><br>"
+                    f"{target:,.2f}"
+                ),
+            )
+
+        entry_group = entry_groups.get(
+            direction,
+            entry_groups["Long"],
+        )
+
+        if first_time <= original_entry_time <= last_time:
+            entry_group["x"].append(original_entry_time)
+            entry_group["y"].append(entry_price)
+            entry_group["text"].append(f"#{trade_number}")
+            entry_group["hover"].append(common_details)
+
+        if first_time <= original_exit_time <= last_time:
+            exit_group = exit_groups[outcome]
+            exit_group["x"].append(original_exit_time)
+            exit_group["y"].append(exit_price)
+            exit_group["text"].append(f"#{trade_number}")
+            exit_group["hover"].append(common_details)
+
+    for outcome, group in path_groups.items():
+        if not group["x"]:
+            continue
+
+        fig.add_trace(
+            go.Scatter(
+                x=group["x"],
+                y=group["y"],
+                mode="lines",
+                line={
+                    "color": outcome_colors[outcome],
+                    "width": 2.2,
+                },
+                name=f"{outcome} trade paths",
+                legendgroup="backtest_trades",
+                showlegend=False,
+                connectgaps=False,
+                hovertext=group["hover"],
+                hovertemplate="%{hovertext}<extra></extra>",
+            )
+        )
+
+    if stop_lines["x"]:
+        fig.add_trace(
+            go.Scatter(
+                x=stop_lines["x"],
+                y=stop_lines["y"],
+                mode="lines",
+                line={
+                    "color": "#ff4d5b",
+                    "width": 1.8,
+                    "dash": "dash",
+                },
+                name="Initial stop losses",
+                legendgroup="backtest_trades",
+                showlegend=False,
+                connectgaps=False,
+                hovertext=stop_lines["hover"],
+                hovertemplate="%{hovertext}<extra></extra>",
+            )
+        )
+
+    if target_lines["x"]:
+        fig.add_trace(
+            go.Scatter(
+                x=target_lines["x"],
+                y=target_lines["y"],
+                mode="lines",
+                line={
+                    "color": "#00e676",
+                    "width": 1.8,
+                    "dash": "dot",
+                },
+                name="Initial take profits",
+                legendgroup="backtest_trades",
+                showlegend=False,
+                connectgaps=False,
+                hovertext=target_lines["hover"],
+                hovertemplate="%{hovertext}<extra></extra>",
+            )
+        )
+
+    for direction, group in entry_groups.items():
+        if not group["x"]:
+            continue
+
+        fig.add_trace(
+            go.Scatter(
+                x=group["x"],
+                y=group["y"],
+                mode="markers+text",
+                marker={
+                    "symbol": group["symbol"],
+                    "size": 15,
+                    "color": group["color"],
+                    "line": {
+                        "color": "#f4f7fb",
+                        "width": 1.5,
+                    },
+                },
+                text=group["text"],
+                textposition="top center",
+                textfont={
+                    "color": group["color"],
+                    "size": 10,
+                },
+                name=f"{direction} entries",
+                legendgroup="backtest_trades",
+                showlegend=False,
+                hovertext=group["hover"],
+                hovertemplate="%{hovertext}<extra></extra>",
+            )
+        )
+
+    for outcome, group in exit_groups.items():
+        if not group["x"]:
+            continue
+
+        fig.add_trace(
+            go.Scatter(
+                x=group["x"],
+                y=group["y"],
+                mode="markers+text",
+                marker={
+                    "symbol": "x",
+                    "size": 13,
+                    "color": outcome_colors[outcome],
+                    "line": {
+                        "color": outcome_colors[outcome],
+                        "width": 2,
+                    },
+                },
+                text=group["text"],
+                textposition="bottom center",
+                textfont={
+                    "color": outcome_colors[outcome],
+                    "size": 10,
+                },
+                name=f"{outcome} exits",
+                legendgroup="backtest_trades",
+                showlegend=False,
+                hovertext=group["hover"],
+                hovertemplate="%{hovertext}<extra></extra>",
+            )
+        )
 
 
 # =========================================================
@@ -2206,7 +2350,7 @@ def create_mplfinance_snapshot(
         0.025,
         retracement_status(chart_data)
         + f" | {latest_structure.get('Trend_State', 'Unavailable')}"
-        + f" Â· {latest_structure.get('Trend_Zone', 'Unavailable')}"
+        + f" · {latest_structure.get('Trend_Zone', 'Unavailable')}"
         + " | Shaded rectangles are separate zones; faded dashed zones are mitigated.",
         color="#aab6c1",
         fontsize=8.5,
@@ -2220,6 +2364,7 @@ def create_mplfinance_snapshot(
     )
 
     output_path = Path(MPLFINANCE_OUTPUT_FILE).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_output_path = output_path.with_name(
         f"{output_path.stem}.tmp{output_path.suffix}"
     )
@@ -2301,7 +2446,13 @@ def defer_plotly_initialization(html: str) -> str:
 def create_interactive_chart(
     results: pd.DataFrame,
     number_of_candles: int = 1200,
-    backtest_summary: dict | None = None,
+    *,
+    output_file: str | Path | None = None,
+    trade_overlays: pd.DataFrame | None = None,
+    custom_dashboard_html: str = "",
+    include_analysis_dashboard: bool = True,
+    trade_history_mode: bool = False,
+    defer_plotly_loading: bool = True,
 ) -> Path:
     """Create a clean interactive SMC chart."""
 
@@ -2330,6 +2481,18 @@ def create_interactive_chart(
     status_text = retracement_status(
         chart_data
     )
+
+    if trade_history_mode:
+        trade_count = (
+            0
+            if trade_overlays is None
+            else len(trade_overlays)
+        )
+        status_text = (
+            f"{trade_count} executed trade"
+            f"{'' if trade_count == 1 else 's'}"
+            " · Hover a numbered marker for its complete audit"
+        )
 
     fig = go.Figure()
 
@@ -2417,11 +2580,11 @@ def create_interactive_chart(
                 else "rgba(255,75,95,0.46)"
             )
 
-        direction_symbol = "â–²" if bullish else "â–¼"
+        direction_symbol = "▲" if bullish else "▼"
         display_text = (
             f"FVG {direction_symbol}"
             if is_active
-            else f"FVG {direction_symbol} Â· filled"
+            else f"FVG {direction_symbol} · filled"
         )
 
         details = (
@@ -2510,11 +2673,11 @@ def create_interactive_chart(
             row.get("OB_OBVolume", 0) or 0
         )
 
-        direction_symbol = "â–²" if bullish else "â–¼"
+        direction_symbol = "▲" if bullish else "▼"
         display_text = (
             f"OB {direction_symbol} {percentage:.0f}%"
             if is_active
-            else f"OB {direction_symbol} {percentage:.0f}% Â· mitigated"
+            else f"OB {direction_symbol} {percentage:.0f}% · mitigated"
         )
 
         details = (
@@ -2701,6 +2864,13 @@ def create_interactive_chart(
         data=chart_data,
     )
 
+    add_backtest_trade_overlays(
+        fig=fig,
+        trades=trade_overlays,
+        first_time=first_time,
+        last_time=last_time,
+    )
+
     # -----------------------------------------------------
     # PREVIOUS DAILY HIGH AND LOW
     # -----------------------------------------------------
@@ -2795,9 +2965,15 @@ def create_interactive_chart(
                 f"<b>{SYMBOL} {TIMEFRAME_NAME}</b>"
                 "<br>"
                 "<sup>"
-                "Hover or tap for details Â· Drag to pan Â· "
-                "Use Indicators to organize overlays"
-                "</sup>"
+                + (
+                    "Hover a numbered entry or exit for trade details · "
+                    "Drag to pan · Use Trades to organize history"
+                    if trade_history_mode
+                    else
+                    "Hover or tap for details · Drag to pan · "
+                    "Use Indicators to organize overlays"
+                )
+                + "</sup>"
             ),
             "x": 0.5,
             "xanchor": "center",
@@ -2813,7 +2989,7 @@ def create_interactive_chart(
         paper_bgcolor="#101215",
         plot_bgcolor="#101215",
         xaxis_title="Time",
-        yaxis_title="Gold Price",
+        yaxis_title=f"{SYMBOL} Price",
         font={
             "family": "Arial",
             "size": 13,
@@ -2908,9 +3084,10 @@ def create_interactive_chart(
         spikemode="across",
     )
 
-    output_path = Path(
-        HTML_OUTPUT_FILE
+    output_path = project_path(
+        output_file or HTML_OUTPUT_FILE
     ).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     chart_config = {
         "responsive": True,
@@ -2929,7 +3106,7 @@ def create_interactive_chart(
         ],
         "toImageButtonOptions": {
             "format": "png",
-            "filename": "xauusd_m15_smc_chart",
+            "filename": f"{SYMBOL.lower()}_{TIMEFRAME_NAME.lower()}_smc_chart",
             "width": 2200,
             "height": 1200,
             "scale": 2,
@@ -2954,7 +3131,6 @@ def create_interactive_chart(
     const yAutoButton = document.getElementById("chart-y-auto");
     const exportButton = document.getElementById("chart-export");
     const mplfinanceButton = document.getElementById("chart-mplfinance");
-    const backtestButton = document.getElementById("chart-backtest");
     const summaryButton = document.getElementById("chart-summary-button");
     const fullscreenButton = document.getElementById("chart-fullscreen");
     const helpButton = document.getElementById("chart-help-button");
@@ -2994,6 +3170,8 @@ def create_interactive_chart(
         levels: ["previous_4h"],
         sessions: ["session_London", "session_NewYork"],
         retracements: ["retracements"]
+        ,
+        trades: ["backtest_trades"]
     };
     let compactMode = null;
     let resizeFrame = null;
@@ -3013,7 +3191,7 @@ def create_interactive_chart(
             "font.size": isCompact ? 11 : 13,
             "title.font.size": isCompact ? 15 : 18,
             "xaxis.title.text": isCompact ? "" : "Time",
-            "yaxis.title.text": isCompact ? "" : "Gold Price"
+            "yaxis.title.text": isCompact ? "" : "__Y_AXIS_TITLE__"
         });
     }
 
@@ -3254,8 +3432,8 @@ def create_interactive_chart(
             if (liveBadge) {
                 liveBadge.dataset.state = status.error ? "error" : "live";
                 liveBadge.textContent = status.error
-                    ? `Live warning Â· ${status.error}`
-                    : `Live Â· ${status.last_candle_time || "waiting"}`;
+                    ? `Live warning · ${status.error}`
+                    : `Live · ${status.last_candle_time || "waiting"}`;
             }
 
             if (
@@ -3385,13 +3563,6 @@ def create_interactive_chart(
         window.open(target, "_blank", "noopener");
     });
 
-    backtestButton?.addEventListener("click", () => {
-        const target = location.protocol === "file:"
-            ? "xauusd_m15_smc_backtest.html"
-            : "/backtest";
-        window.open(target, "_blank", "noopener");
-    });
-
     summaryButton?.addEventListener("click", () => {
         document.getElementById("chart-summary")?.scrollIntoView({
             behavior: "smooth",
@@ -3435,7 +3606,6 @@ def create_interactive_chart(
         if (event.key.toLowerCase() === "i") indicatorButton?.click();
         if (event.key.toLowerCase() === "e") exportButton?.click();
         if (event.key.toLowerCase() === "p") mplfinanceButton?.click();
-        if (event.key.toLowerCase() === "b") backtestButton?.click();
         if (event.key.toLowerCase() === "s") summaryButton?.click();
         if (event.key.toLowerCase() === "h") helpButton?.click();
         if (event.key === "1") oneDayButton?.click();
@@ -3488,6 +3658,10 @@ def create_interactive_chart(
             "__LIVE_REFRESH_MS__",
             str(LIVE_REFRESH_SECONDS * 1000),
         )
+        .replace(
+            "__Y_AXIS_TITLE__",
+            f"{SYMBOL} Price",
+        )
     )
 
     ensure_plotly_js_asset()
@@ -3499,15 +3673,16 @@ def create_interactive_chart(
         div_id="smc-chart",
         post_script=responsive_script,
     )
-    html = defer_plotly_initialization(
-        html
-    )
 
-    plotly_loader_script = f"""
+    if defer_plotly_loading:
+        html = defer_plotly_initialization(
+            html
+        )
+        plotly_loader_script = f"""
 <script>
     window.addEventListener("DOMContentLoaded", () => {{
         const script = document.createElement("script");
-        script.src = "{PLOTLY_JS_FILE}";
+        script.src = "../{PLOTLY_JS_FILE}";
         script.onload = () => window.dispatchEvent(
             new Event("smc-plotly-ready")
         );
@@ -3525,6 +3700,18 @@ def create_interactive_chart(
             }}
         }};
         document.head.appendChild(script);
+    }});
+</script>
+"""
+    else:
+        # The standalone backtest already waits for its report to be built
+        # before opening the browser. A normal blocking local script avoids a
+        # missed custom-event race that could leave the loading overlay visible.
+        plotly_loader_script = f"""
+<script src="/{PLOTLY_JS_FILE}"></script>
+<script>
+    window.addEventListener("DOMContentLoaded", () => {{
+        window.dispatchEvent(new Event("smc-plotly-ready"));
     }});
 </script>
 """
@@ -3600,6 +3787,12 @@ def create_interactive_chart(
 
     .chart-loading[hidden] {
         display: none;
+    }
+
+    body.trade-history-mode #chart-shell {
+        height: min(780px, 78vh);
+        min-height: 540px;
+        border-bottom: 1px solid #27313a;
     }
 
     .chart-loading-spinner {
@@ -4263,7 +4456,6 @@ def create_interactive_chart(
             <button id="chart-summary-button" type="button" title="Open summary and indicator guide (S)">Summary</button>
             <button id="chart-export" type="button" title="Export a PNG image (E)">Export</button>
             <button id="chart-mplfinance" type="button" title="Open the clean mplfinance chart (P)">MPL View</button>
-            <button id="chart-backtest" type="button" title="Open interactive strategy backtest (B)">Backtest</button>
             <button id="chart-fullscreen" type="button" title="Toggle fullscreen (F)" aria-pressed="false">Fullscreen</button>
             <button id="chart-help-button" type="button" title="Chart help and shortcuts (H)">Help</button>
         </span>
@@ -4280,7 +4472,7 @@ def create_interactive_chart(
     <aside id="indicator-panel" class="indicator-panel" aria-label="Indicator controls" hidden>
         <header class="panel-header">
             <h2>Indicator layers</h2>
-            <button id="close-indicators" class="icon-button" type="button" aria-label="Close indicator panel">Ã—</button>
+            <button id="close-indicators" class="icon-button" type="button" aria-label="Close indicator panel">×</button>
         </header>
 
         <div class="panel-actions">
@@ -4339,6 +4531,11 @@ def create_interactive_chart(
                 <span>Retracement Turns</span>
                 <input type="checkbox" data-layer="retracements" checked>
             </label>
+            <label class="layer-option">
+                <span class="layer-swatch" style="--swatch:#27e1b5"></span>
+                <span>Backtest Entries, SL &amp; TP</span>
+                <input type="checkbox" data-layer="trades" checked>
+            </label>
         </fieldset>
 
         <fieldset>
@@ -4377,9 +4574,9 @@ def create_interactive_chart(
                 <li>Drag directly on an axis for manual scaling.</li>
             </ul>
             <h3>Keyboard shortcuts</h3>
-            <p>1/3/7: time range Â· R: all Â· +/-: vertical zoom Â· 0: Y Auto Â· I: indicators Â· S: summary Â· E: export Â· P: mplfinance view Â· B: backtest Â· F: fullscreen Â· H: help</p>
+            <p>1/3/7: time range · R: all · +/-: vertical zoom · 0: Y Auto · I: indicators · S: summary · E: export · P: mplfinance view · F: fullscreen · H: help</p>
             <h3>Indicator abbreviations</h3>
-            <p>FVG: Fair Value Gap Â· OB: Order Block Â· BSL/SSL: buy-side/sell-side liquidity Â· HH/HL/LH/LL: swing sequence Â· EQ: dealing-range midpoint Â· PH/PL: previous high/low Â· C/D: current/deepest retracement.</p>
+            <p>FVG: Fair Value Gap · OB: Order Block · BSL/SSL: buy-side/sell-side liquidity · HH/HL/LH/LL: swing sequence · EQ: dealing-range midpoint · PH/PL: previous high/low · C/D: current/deepest retracement.</p>
             <div class="help-footer">
                 <button id="close-help" type="button">Done</button>
             </div>
@@ -4397,12 +4594,152 @@ def create_interactive_chart(
             "__MPLFINANCE_OUTPUT_FILE__",
             MPLFINANCE_OUTPUT_FILE,
         )
+        .replace("XAUUSD", SYMBOL)
     )
 
-    dashboard_html = build_analysis_dashboard(
-        data,
-        backtest_summary=backtest_summary,
+    if trade_history_mode:
+        chart_controls = (
+            chart_controls
+            .replace(
+                'title="Organize indicators (I)"',
+                'title="Organize executed trades (I)"',
+            )
+            .replace(
+                """
+                Indicators
+            """,
+                """
+                Trades
+            """,
+                1,
+            )
+            .replace(
+                'aria-label="Indicator controls"',
+                'aria-label="Executed trade controls"',
+            )
+            .replace(
+                "<h2>Indicator layers</h2>",
+                "<h2>Executed trade layers</h2>",
+            )
+            .replace(
+                'aria-label="Close indicator panel">×',
+                'aria-label="Close trade panel">×',
+            )
+            .replace(
+                "<legend>Smart Money Concepts</legend>",
+                "<legend>Trade execution</legend>",
+            )
+            .replace(
+                "<span>Backtest Entries, SL &amp; TP</span>",
+                "<span>Entries, exits, SL &amp; TP</span>",
+            )
+            .replace(
+                "Checked means enabled. Signals only appear where detected; use All and Y Auto when a layer is outside the current view.",
+                "Checked means visible. Each entry and exit uses the same trade number; use All Trades and Y Auto to inspect the complete execution history.",
+            )
+            .replace(
+                "<span>Indicator labels</span>",
+                "<span>Trade numbers</span>",
+            )
+            .replace(
+                '<input id="toggle-labels" type="checkbox">',
+                '<input id="toggle-labels" type="checkbox" checked>',
+            )
+            .replace(
+                'title="All loaded candles (R)">All</button>',
+                'title="All executed trade history (R)">All Trades</button>',
+            )
+            .replace(
+                'title="Open summary and indicator guide (S)">Summary</button>',
+                'title="Open results and complete trade history (S)">Results</button>',
+            )
+            .replace(
+                '<button id="chart-mplfinance" type="button" title="Open the clean mplfinance chart (P)">MPL View</button>',
+                "",
+            )
+            .replace(
+                "<p>Drag the chart to move through time. Use the mouse wheel or trackpad to zoom. Hover or tap an indicator for exact values.</p>",
+                "<p>Drag the chart to move through time. Use the mouse wheel or trackpad to zoom. Hover or tap a numbered entry, exit, SL, or TP for the complete trade audit.</p>",
+            )
+            .replace(
+                "<h3>Indicator abbreviations</h3>",
+                "<h3>Trade markers</h3>",
+            )
+            .replace(
+                "<p>FVG: Fair Value Gap · OB: Order Block · BSL/SSL: buy-side/sell-side liquidity · HH/HL/LH/LL: swing sequence · EQ: dealing-range midpoint · PH/PL: previous high/low · C/D: current/deepest retracement.</p>",
+                "<p>Green ▲: long entry · Red ▼: short entry · Green/red ×: winning/losing exit · Dashed red: initial SL · Dotted green: initial TP.</p>",
+            )
+            .replace("I: indicators", "I: trades")
+            .replace("S: summary", "S: results")
+            .replace(" · P: mplfinance view", "")
+        )
+
+        analysis_layer_labels = (
+            "Fair Value Gaps",
+            "Order Blocks",
+            "Liquidity &amp; Sweeps",
+            "BOS &amp; CHoCH",
+            "Swing Structure",
+            "Structure Map &amp; Range",
+            "Previous 4H Levels",
+            "Trading Sessions",
+            "Retracement Turns",
+        )
+
+        for label_text in analysis_layer_labels:
+            label_index = chart_controls.find(label_text)
+
+            if label_index < 0:
+                continue
+
+            label_start = chart_controls.rfind(
+                '<label class="layer-option">',
+                0,
+                label_index,
+            )
+            label_end = chart_controls.find(
+                "</label>",
+                label_index,
+            )
+
+            if label_start >= 0 and label_end >= 0:
+                chart_controls = (
+                    chart_controls[:label_start]
+                    + chart_controls[
+                        label_end + len("</label>"):
+                    ]
+                )
+
+    dashboard_html = (
+        build_analysis_dashboard(data)
+        if include_analysis_dashboard
+        else ""
     )
+
+    if not trade_history_mode:
+        trade_label_text = "Backtest Entries, SL &amp; TP"
+        trade_label_index = chart_controls.find(trade_label_text)
+
+        if trade_label_index >= 0:
+            trade_label_start = chart_controls.rfind(
+                '<label class="layer-option">',
+                0,
+                trade_label_index,
+            )
+            trade_label_end = chart_controls.find(
+                "</label>",
+                trade_label_index,
+            )
+
+            if trade_label_start >= 0 and trade_label_end >= 0:
+                chart_controls = (
+                    chart_controls[:trade_label_start]
+                    + chart_controls[
+                        trade_label_end + len("</label>"):
+                    ]
+                )
+
+    dashboard_html = custom_dashboard_html + dashboard_html
 
     html = html.replace(
         "</head>",
@@ -4413,7 +4750,12 @@ def create_interactive_chart(
 
     html = html.replace(
         "<body>",
-        f"<body>{chart_controls}",
+        (
+            '<body class="trade-history-mode">'
+            if trade_history_mode
+            else "<body>"
+        )
+        + chart_controls,
         1,
     )
 
@@ -4488,8 +4830,8 @@ def build_mplfinance_viewer() -> str:
 <body>
     <header>
         <div>
-            <h1>XAUUSD M15 Â· mplfinance clean view</h1>
-            <p id="status" data-state="live">Loading latest completed candleâ€¦</p>
+            <h1>XAUUSD M15 · mplfinance clean view</h1>
+            <p id="status" data-state="live">Loading latest completed candle…</p>
         </div>
         <nav>
             <a href="/">Interactive dashboard</a>
@@ -4511,8 +4853,8 @@ def build_mplfinance_viewer() -> str:
                 const live = await response.json();
                 status.dataset.state = live.error ? "error" : "live";
                 status.textContent = live.error
-                    ? `Live warning Â· ${live.error}`
-                    : `Live Â· completed candle ${live.last_candle_time || "waiting"}`;
+                    ? `Live warning · ${live.error}`
+                    : `Live · completed candle ${live.last_candle_time || "waiting"}`;
 
                 if (seenVersion === null || live.version !== seenVersion) {
                     seenVersion = live.version;
@@ -4531,8 +4873,17 @@ def build_mplfinance_viewer() -> str:
 </html>
 """
 
-    return viewer.replace(
-        "__LIVE_REFRESH_MS__",
-        str(LIVE_REFRESH_SECONDS * 1000),
+    return (
+        viewer
+        .replace(
+            "__LIVE_REFRESH_MS__",
+            str(LIVE_REFRESH_SECONDS * 1000),
+        )
+        .replace("XAUUSD", SYMBOL)
+        .replace("M15", TIMEFRAME_NAME)
+        .replace(
+            "xauusd_m15_smc_snapshot.png",
+            Path(MPLFINANCE_OUTPUT_FILE).name,
+        )
     )
 

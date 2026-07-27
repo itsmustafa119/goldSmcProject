@@ -1,12 +1,25 @@
 from pathlib import Path
 import atexit
 import msvcrt
-import threading
+import os
 
-SYMBOL = "XAUUSD"
-TIMEFRAME = None
-TIMEFRAME_NAME = "M15"
-TIMEFRAME_MINUTES = 15
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+OUTPUT_DIRECTORY = PROJECT_ROOT / "outputs"
+
+SYMBOL = os.getenv("SMC_SYMBOL", "XAUUSD").strip() or "XAUUSD"
+TIMEFRAME_NAME = os.getenv("SMC_TIMEFRAME", "M15").strip().upper()
+TIMEFRAME_MINUTES_BY_NAME = {
+    "M15": 15,
+    "H1": 60,
+    "H4": 240,
+}
+
+if TIMEFRAME_NAME not in TIMEFRAME_MINUTES_BY_NAME:
+    raise ValueError(
+        "SMC_TIMEFRAME must be one of M15, H1, or H4."
+    )
+
+TIMEFRAME_MINUTES = TIMEFRAME_MINUTES_BY_NAME[TIMEFRAME_NAME]
 
 NUMBER_OF_CANDLES = 5000
 CHART_CANDLES = 1200
@@ -28,28 +41,25 @@ MAX_SWING_MARKERS = 40
 # Windows process lock for preventing duplicate dashboard instances
 INSTANCE_LOCK_FILE = ".gold_smc.lock"
 
-CSV_OUTPUT_FILE = "xauusd_m15_smc_results.csv"
-HTML_OUTPUT_FILE = "xauusd_m15_smc_chart.html"
+OUTPUT_STEM = "".join(
+    character.lower()
+    for character in f"{SYMBOL}_{TIMEFRAME_NAME}"
+    if character.isalnum() or character == "_"
+)
+CSV_OUTPUT_FILE = f"outputs/{OUTPUT_STEM}_indicators.csv"
+HTML_OUTPUT_FILE = f"outputs/{OUTPUT_STEM}_chart.html"
 PLOTLY_JS_FILE = "plotly.min.js"
-MPLFINANCE_OUTPUT_FILE = "xauusd_m15_smc_snapshot.png"
+MPLFINANCE_OUTPUT_FILE = f"outputs/{OUTPUT_STEM}_snapshot.png"
 MPLFINANCE_CANDLES = 300
-BACKTEST_OUTPUT_FILE = "xauusd_m15_smc_backtest.html"
-BACKTEST_TRADES_FILE = "xauusd_m15_smc_trades.csv"
 
-BACKTEST_CASH = 100_000
-BACKTEST_SPREAD = 0.0001
-BACKTEST_MARGIN = 0.05
-BACKTEST_POSITION_FRACTION = 0.10
-BACKTEST_RISK_REWARD = 2.0
-BACKTEST_ATR_MULTIPLIER = 1.5
-
-LIVE_MODE = True
+LIVE_MODE = os.getenv("SMC_LIVE_MODE", "1") not in {
+    "0",
+    "false",
+    "False",
+}
 LIVE_REFRESH_SECONDS = 5
 LIVE_HOST = "127.0.0.1"
 LIVE_PORT = 8765
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
 
 def project_path(filename: str | Path) -> Path:
     """Resolve a project-relative path to the repository root."""

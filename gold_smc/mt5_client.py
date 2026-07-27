@@ -3,14 +3,18 @@ from pathlib import Path
 import MetaTrader5 as mt5
 import pandas as pd
 
-from .config import SYMBOL
+from .config import SYMBOL, TIMEFRAME_NAME
 
 
-TIMEFRAME = mt5.TIMEFRAME_M15
+TIMEFRAME = {
+    "M15": mt5.TIMEFRAME_M15,
+    "H1": mt5.TIMEFRAME_H1,
+    "H4": mt5.TIMEFRAME_H4,
+}[TIMEFRAME_NAME]
 
 
-def find_gold_symbols() -> list[str]:
-    """Find possible gold symbols in MetaTrader 5."""
+def find_matching_symbols(preferred: str = SYMBOL) -> list[str]:
+    """Find possible broker variants of an instrument symbol."""
 
     symbols = mt5.symbols_get()
 
@@ -20,8 +24,7 @@ def find_gold_symbols() -> list[str]:
     return [
         item.name
         for item in symbols
-        if "XAU" in item.name.upper()
-        or "GOLD" in item.name.upper()
+        if preferred.upper() in item.name.upper()
     ]
 
 
@@ -37,7 +40,7 @@ def get_mt5_candles(
     if symbol_info is None:
         raise ValueError(
             f"Symbol '{symbol}' was not found.\n"
-            f"Possible gold symbols: {find_gold_symbols()}"
+            f"Possible matching symbols: {find_matching_symbols(symbol)}"
         )
 
     if not symbol_info.visible:

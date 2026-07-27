@@ -1,5 +1,6 @@
 import time
 import webbrowser
+import os
 from pathlib import Path
 
 import MetaTrader5 as mt5
@@ -7,14 +8,6 @@ import pandas as pd
 
 from .chart import create_interactive_chart, create_mplfinance_snapshot, latest_value
 from .config import (
-    BACKTEST_ATR_MULTIPLIER,
-    BACKTEST_CASH,
-    BACKTEST_MARGIN,
-    BACKTEST_OUTPUT_FILE,
-    BACKTEST_POSITION_FRACTION,
-    BACKTEST_RISK_REWARD,
-    BACKTEST_SPREAD,
-    BACKTEST_TRADES_FILE,
     CHART_CANDLES,
     CSV_OUTPUT_FILE,
     HTML_OUTPUT_FILE,
@@ -25,12 +18,12 @@ from .config import (
     NUMBER_OF_CANDLES,
     SWING_LENGTH,
     SYMBOL,
+    TIMEFRAME_NAME,
     project_path,
 )
 from .dashboard import start_live_dashboard_server, update_live_state
 from .indicators import calculate_smc_indicators
 from .mt5_client import TIMEFRAME, get_mt5_candles, get_mt5_live_price
-import smc_backtest
 
 
 def count_signals(
@@ -54,7 +47,7 @@ def print_summary(
     latest = results.iloc[-1]
 
     print("\n========================================")
-    print("LATEST XAUUSD DATA")
+    print(f"LATEST {SYMBOL} {TIMEFRAME_NAME} DATA")
     print("========================================")
     print(f"Time:  {latest['time']}")
     print(f"Close: {latest['close']:.2f}")
@@ -123,6 +116,7 @@ def analyze_and_write_outputs(
     csv_path = project_path(
         CSV_OUTPUT_FILE
     ).resolve()
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_csv_path = csv_path.with_suffix(
         ".tmp"
     )
@@ -144,31 +138,9 @@ def analyze_and_write_outputs(
             missing_ok=True
         )
 
-    backtest_summary = None
-
-    try:
-        backtest_summary = smc_backtest.run_smc_backtest(
-            results,
-            output_file=BACKTEST_OUTPUT_FILE,
-            trades_file=BACKTEST_TRADES_FILE,
-            swing_confirmation_bars=SWING_LENGTH,
-            cash=BACKTEST_CASH,
-            spread=BACKTEST_SPREAD,
-            margin=BACKTEST_MARGIN,
-            position_fraction=BACKTEST_POSITION_FRACTION,
-            risk_reward=BACKTEST_RISK_REWARD,
-            atr_multiplier=BACKTEST_ATR_MULTIPLIER,
-        )
-    except Exception as backtest_error:
-        print(
-            "Backtest warning: "
-            f"{backtest_error}"
-        )
-
     chart_path = create_interactive_chart(
         results=results,
         number_of_candles=CHART_CANDLES,
-        backtest_summary=backtest_summary,
     )
 
     create_mplfinance_snapshot(
@@ -193,7 +165,7 @@ def main() -> None:
     try:
         print(
             f"Downloading {NUMBER_OF_CANDLES} completed "
-            f"{SYMBOL} M15 candles..."
+            f"{SYMBOL} {TIMEFRAME_NAME} candles..."
         )
 
         candles = get_mt5_candles(
@@ -227,15 +199,6 @@ def main() -> None:
             "MPL chart:  "
             f"{project_path(MPLFINANCE_OUTPUT_FILE).resolve()}"
         )
-        print(
-            "Backtest:   "
-            f"{project_path(BACKTEST_OUTPUT_FILE).resolve()}"
-        )
-        print(
-            "Trades:     "
-            f"{project_path(BACKTEST_TRADES_FILE).resolve()}"
-        )
-
         last_candle_time = pd.Timestamp(
             results["time"].iloc[-1]
         )
@@ -254,10 +217,11 @@ def main() -> None:
         )
 
         if not LIVE_MODE:
-            print("\nOpening static chart in your browser...")
-            webbrowser.open_new_tab(
-                chart_path.as_uri()
-            )
+            if os.getenv("SMC_NO_BROWSER") != "1":
+                print("\nOpening static chart in your browser...")
+                webbrowser.open_new_tab(
+                    chart_path.as_uri()
+                )
             return
 
         live_server, dashboard_url = (
@@ -273,12 +237,13 @@ def main() -> None:
         )
         print(
             "The chart recalculates after each completed "
-            f"M15 candle. Press Ctrl+C to stop."
+            f"{TIMEFRAME_NAME} candle. Press Ctrl+C to stop."
         )
 
-        webbrowser.open_new_tab(
-            dashboard_url
-        )
+        if os.getenv("SMC_NO_BROWSER") != "1":
+            webbrowser.open_new_tab(
+                dashboard_url
+            )
 
         last_error_message = None
 
@@ -290,7 +255,7 @@ def main() -> None:
             try:
                 recent_candles = get_mt5_candles(
                     symbol=SYMBOL,
-                    timeframe=mt5.TIMEFRAME_M15,
+                    timeframe=TIMEFRAME,
                     candle_count=2,
                 )
 

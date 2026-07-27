@@ -1,186 +1,103 @@
-# XAUUSD Smart Money Concepts Dashboard
+# MT5 Smart Money Concepts
 
-A local Python application for analyzing gold/forex candles from MetaTrader 5, displaying Smart Money Concepts on an interactive chart, and testing a simple rule-based strategy with historical data.
+A focused MetaTrader 5 project with two workflows:
 
-The application combines:
+1. `run_analysis.bat` downloads a selected market and displays the interactive
+   Smart Money Concepts chart.
+2. `run_backtest.bat` applies a selected strategy to a selected market and
+   timeframe, then displays the audited results.
 
-```text
-MetaTrader 5 candles
-        |
-        v
-smartmoneyconcepts indicators
-        |
-        v
-Plotly dashboard + mplfinance snapshot
-        |
-        v
-backtesting.py strategy simulation
-```
-
-> This project is for education and research. Its indicators and backtest results are not financial advice, forecasts, or guarantees of future performance.
-
-![XAUUSD Smart Money Concepts chart](xauusd_m15_smc_snapshot.png)
-
-## Features
-
-- Downloads completed XAUUSD M15 candles from MetaTrader 5.
-- Detects separate bullish and bearish Fair Value Gaps.
-- Draws bullish and bearish order blocks.
-- Shows BOS, CHoCH, liquidity pools, and liquidity sweeps.
-- Maps swing structure as HH, HL, LH, LL, support, and resistance.
-- Calculates premium, discount, and equilibrium within the current dealing range.
-- Adds previous daily/4H levels, London/New York sessions, and retracements.
-- Provides an interactive Plotly chart with indicator filters, time-range controls, candle-focused vertical scaling, zoom, export, and fullscreen support.
-- Creates a clean mplfinance PNG chart.
-- Recalculates after each newly completed MT5 candle.
-- Runs a causal backtesting.py strategy and creates an interactive performance report and trade list.
+Both launchers ask for the instrument and timeframe in the terminal. Supported
+timeframes are M15, H1, and H4. Common instruments are listed, and a custom MT5
+symbol can be entered when the broker uses another market.
 
 ## Requirements
 
 - Windows
-- Python and `pip`
-- MetaTrader 5 desktop terminal
-- A logged-in MT5 account with a gold symbol supplied by the broker
+- MetaTrader 5 installed, open, logged in, and connected
+- Python virtual environment in `.venv`
 
-The default symbol is `XAUUSD`. Some brokers use names such as `XAUUSDm`, `XAUUSD.a`, or `GOLD`; see [Changing the symbol](docs/USAGE.md#changing-the-symbol) if needed.
-
-## Quick start
-
-Open PowerShell in the folder where you want the project and run:
+Install the dependencies with:
 
 ```powershell
-git clone https://github.com/itsmustafa119/goldSmcProject.git
-cd goldSmcProject
-py -m venv .venv
-.venv\Scripts\python.exe -m pip install --upgrade pip
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-Then:
+## Market analysis
 
-1. Open MetaTrader 5 and log in.
-2. Double-click `start_gold_smc.bat`.
-3. Keep the terminal window open while using the dashboard.
-4. Press `Ctrl+C` in that window to stop the application.
-
-Alternatively, you can start the application directly with Python from the project root:
-
-```powershell
-.venv\Scripts\python.exe analyze_gold_mt5.py
-```
-
-or:
-
-```powershell
-.venv\Scripts\python.exe -m gold_smc
-```
-
-The application opens the dashboard automatically. Its default address is:
+Double-click:
 
 ```text
-http://127.0.0.1:8765/
+run_analysis.bat
 ```
 
-If that port is busy, the terminal prints the next available address.
+Choose the instrument and timeframe. The browser chart includes:
 
-For a slower, step-by-step walkthrough, read [Simple usage documentation](docs/USAGE.md).
+- candlesticks and volume;
+- fair value gaps;
+- order blocks;
+- liquidity levels and sweeps;
+- BOS and CHoCH;
+- swing structure and dealing range;
+- previous daily and four-hour levels;
+- London and New York sessions;
+- retracement, confluence, and live-session panels.
 
-## Dashboard controls
+Only completed MT5 candles are analyzed. The dashboard checks for newly
+completed candles and refreshes the indicators automatically.
 
-| Control | Purpose |
-| --- | --- |
-| Indicators | Show or hide individual SMC layers and labels |
-| 1D / 3D / 1W / All | Change the visible candle range |
-| Y+ / Y- | Zoom the price axis vertically |
-| Y Auto | Fit the vertical scale to the visible candles |
-| Summary | Open current market values and indicator definitions |
-| Export | Save the Plotly chart as a PNG |
-| MPL View | Open the cleaner mplfinance chart |
-| Backtest | Open the interactive strategy report |
-| Fullscreen | Expand the chart to the full screen |
-| Help | Show mouse and keyboard instructions |
+## Strategy backtesting
 
-Keyboard shortcuts are also available: `1`, `3`, `7`, `R`, `+`, `-`, `0`, `I`, `S`, `E`, `P`, `B`, `F`, and `H`.
+Double-click:
+
+```text
+run_backtest.bat
+```
+
+Choose the instrument, execution timeframe, and one of the three retained
+strategy files:
+
+- `strategies/mtf_trend_pullback.py`
+- `strategies/ict_liquidity_fvg.py`
+- `strategies/confirmed_smc_pullback.py`
+
+The report shows entries, exits, initial stop-losses, take-profits, win rate,
+balance, P&L, drawdown, trade history, and the indicator values recorded at
+each entry. Its chart uses the same controls and styling as the analysis
+chart, but displays only the selected execution timeframe and audited trade
+overlays instead of the SMC analysis layers.
+
+Backtests use completed candles and modeled execution costs. They are
+historical simulations, not guarantees of future performance.
 
 ## Generated files
 
-These files are recreated while the application runs. The data and HTML reports are excluded from Git; the example snapshot is tracked so it can be shown in this README.
-
-| File | Description |
-| --- | --- |
-| `xauusd_m15_smc_results.csv` | Candles and all calculated indicator columns |
-| `xauusd_m15_smc_chart.html` | Standalone interactive Plotly dashboard |
-| `xauusd_m15_smc_snapshot.png` | Clean mplfinance chart image |
-| `xauusd_m15_smc_backtest.html` | Interactive backtesting.py result |
-| `xauusd_m15_smc_trades.csv` | Completed simulated trades |
-
-## Backtest rules
-
-The included strategy is a transparent baseline, not an optimized trading system.
-
-- A long setup requires a confirmed uptrend, bullish structure bias, and a move into discount.
-- A short setup requires a confirmed downtrend, bearish structure bias, and a move into premium.
-- Swing-derived values are delayed by the swing confirmation window to reduce look-ahead bias.
-- BOS and CHoCH are assigned to the candle that actually breaks the structure level.
-- The stop uses the dealing-range boundary and a minimum ATR distance.
-- The default target is `2R`.
-- Only one simulated position is open at a time.
-
-Default assumptions are visible in the dashboard and can be changed near the top of `analyze_gold_mt5.py`.
-
-Backtests still omit or simplify real-world effects such as broker contract sizing, variable spreads, slippage, financing, news restrictions, and failed execution.
-
-## Configuration
-
-The main settings are grouped at the top of `analyze_gold_mt5.py`:
-
-| Setting | Default | Meaning |
-| --- | ---: | --- |
-| `SYMBOL` | `XAUUSD` | MT5 instrument name |
-| `TIMEFRAME` | `M15` | Candle timeframe |
-| `NUMBER_OF_CANDLES` | `5000` | Historical candles requested from MT5 |
-| `SWING_LENGTH` | `20` | Swing confirmation window |
-| `LIVE_MODE` | `True` | Keep the local dashboard server running |
-| `LIVE_REFRESH_SECONDS` | `5` | Frequency of MT5 checks |
-| `BACKTEST_RISK_REWARD` | `2.0` | Take-profit multiple of initial risk |
-| `BACKTEST_POSITION_FRACTION` | `0.10` | Fractional position size used by the simulator |
-
-After changing a setting, stop and restart the launcher.
+Runtime files are written under `outputs/` and are intentionally excluded from
+Git. The local Plotly runtime is generated automatically when missing.
 
 ## Project structure
 
-```text
-goldSmcProject/
-|-- analyze_gold_mt5.py   # Lightweight wrapper entrypoint for the package
-|-- gold_smc/             # Refactored reusable package
-|-- smc_backtest.py       # Causal strategy preparation and backtesting.py integration
-|-- start_gold_smc.bat    # One-click Windows launcher
-|-- requirements.txt      # Python dependencies
-|-- docs/
-|   `-- USAGE.md          # Simple installation and usage guide
-|-- tests/                # Unit tests for package helpers
-`-- xauusd_m15_smc_snapshot.png
-```
+- `gold_smc/` contains the shared application, chart, MT5, and backtest code.
+- `strategies/` contains only the editable strategy definitions.
+- `tests/` contains the automated regression tests.
+- `run_analysis.bat` and `run_backtest.bat` are the only supported launchers.
+- `outputs/`, `plotly.min.js`, lock files, caches, and bytecode are generated
+  locally and can be deleted safely.
 
-## Running tests
+## Command-line options
 
-From the project root, run the unit tests with:
+The launchers accept optional arguments for repeatable runs:
 
 ```powershell
-.venv\Scripts\python.exe -m unittest discover -s tests -p 'test_*.py'
+run_analysis.bat --symbol EURUSD --timeframe H1
+
+run_backtest.bat --symbol XAUUSD --timeframe M15 --strategy strategies\ict_liquidity_fvg.py
 ```
 
-## Libraries used
+Backtest-only options:
 
-- [joshyattridge/smart-money-concepts](https://github.com/joshyattridge/smart-money-concepts) for FVG, swing, BOS/CHoCH, order-block, liquidity, level, session, and retracement calculations.
-- [Plotly](https://plotly.com/python/) for the main interactive dashboard.
-- [matplotlib/mplfinance](https://github.com/matplotlib/mplfinance) for the clean static financial chart.
-- [kernc/backtesting.py](https://github.com/kernc/backtesting.py) for strategy execution, statistics, trade markers, and the interactive backtest report.
-- The structure map and dealing-range presentation were also informed by [rabichawila/smart-money-py](https://github.com/rabichawila/smart-money-py).
+- `--use-cache` reuses the latest cached candles.
+- `--no-browser` does not open the report automatically.
+- `--once` writes the result and exits without keeping a local service open.
 
-## Important limitations
-
-- SMC definitions vary between traders; these labels are algorithmic interpretations.
-- Confirmed swing indicators necessarily appear after later candles confirm the pivot.
-- Historical results depend strongly on data quality and execution assumptions.
-- Test with broker-specific symbol details and a demo account before using the analysis in any real decision.
+See [docs/USAGE.md](docs/USAGE.md) for troubleshooting.
