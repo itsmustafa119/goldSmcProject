@@ -26,6 +26,23 @@ from .config import (
     TIMEFRAME_NAME,
     project_path,
 )
+from .theme import (
+    ACCENT,
+    BACKGROUND,
+    BORDER,
+    FONT_SANS,
+    FONT_SERIF,
+    GRID,
+    NEGATIVE,
+    NEGATIVE_STRONG,
+    POSITIVE,
+    POSITIVE_STRONG,
+    SURFACE_STRONG,
+    TEXT,
+    TEXT_MUTED,
+    TEXT_STRONG,
+    CSS_VARIABLES,
+)
 
 
 def indicator_is_active(value) -> bool:
@@ -1760,33 +1777,34 @@ def create_mplfinance_snapshot(
     )
 
     market_colors = mpf.make_marketcolors(
-        up="#19c9a5",
-        down="#ff4d5b",
+        up=POSITIVE,
+        down=NEGATIVE,
         edge="inherit",
         wick={
-            "up": "#4ee8c8",
-            "down": "#ff7480",
+            "up": POSITIVE_STRONG,
+            "down": NEGATIVE_STRONG,
         },
         volume={
-            "up": "#167f6d",
-            "down": "#9f3742",
+            "up": "#3d7f6c",
+            "down": "#8a4546",
         },
     )
 
     chart_style = mpf.make_mpf_style(
         base_mpf_style="nightclouds",
         marketcolors=market_colors,
-        facecolor="#101215",
-        figcolor="#101215",
-        gridcolor="#29313a",
+        facecolor=BACKGROUND,
+        figcolor=BACKGROUND,
+        gridcolor=GRID,
         gridstyle="-",
         y_on_right=True,
         rc={
-            "axes.edgecolor": "#46515c",
-            "axes.labelcolor": "#c9d4de",
-            "text.color": "#e8eef4",
-            "xtick.color": "#a9b5c0",
-            "ytick.color": "#a9b5c0",
+            "axes.edgecolor": BORDER,
+            "axes.labelcolor": TEXT,
+            "text.color": TEXT_STRONG,
+            "xtick.color": TEXT_MUTED,
+            "ytick.color": TEXT_MUTED,
+            "font.family": "serif",
             "font.size": 9,
         },
     )
@@ -2961,22 +2979,7 @@ def create_interactive_chart(
 
     fig.update_layout(
         title={
-            "text": (
-                f"<b>{SYMBOL} {TIMEFRAME_NAME}</b>"
-                "<br>"
-                "<sup>"
-                + (
-                    "Hover a numbered entry or exit for trade details · "
-                    "Drag to pan · Use Trades to organize history"
-                    if trade_history_mode
-                    else
-                    "Hover or tap for details · Drag to pan · "
-                    "Use Indicators to organize overlays"
-                )
-                + "</sup>"
-            ),
-            "x": 0.5,
-            "xanchor": "center",
+            "text": "",
         },
         template="plotly_dark",
         autosize=True,
@@ -2986,13 +2989,14 @@ def create_interactive_chart(
         hoverdistance=30,
         spikedistance=-1,
         showlegend=False,
-        paper_bgcolor="#101215",
-        plot_bgcolor="#101215",
+        paper_bgcolor=BACKGROUND,
+        plot_bgcolor=BACKGROUND,
         xaxis_title="Time",
         yaxis_title=f"{SYMBOL} Price",
         font={
-            "family": "Arial",
+            "family": FONT_SANS,
             "size": 13,
+            "color": TEXT,
         },
         legend={
             "orientation": "h",
@@ -3001,8 +3005,8 @@ def create_interactive_chart(
             "xanchor": "center",
             "x": 0.5,
             "groupclick": "togglegroup",
-            "bgcolor": "rgba(15,15,15,0.80)",
-            "bordercolor": "#555",
+            "bgcolor": "rgba(23, 32, 27, 0.90)",
+            "bordercolor": BORDER,
             "borderwidth": 1,
             "font": {
                 "size": 11,
@@ -3015,8 +3019,13 @@ def create_interactive_chart(
             "b": 90,
         },
         hoverlabel={
-            "bgcolor": "#20242a",
-            "font_size": 12,
+            "bgcolor": SURFACE_STRONG,
+            "bordercolor": ACCENT,
+            "font": {
+                "family": FONT_SANS,
+                "color": TEXT_STRONG,
+                "size": 12,
+            },
         },
     )
 
@@ -3064,9 +3073,9 @@ def create_interactive_chart(
             "visible": True,
             "thickness": 0.07,
         },
-        gridcolor="#29313a",
+        gridcolor=GRID,
         showspikes=True,
-        spikecolor="#dddddd",
+        spikecolor=TEXT_MUTED,
         spikemode="across",
     )
 
@@ -3076,11 +3085,11 @@ def create_interactive_chart(
             default_price_high + default_price_padding,
         ],
         autorange=False,
-        gridcolor="#29313a",
+        gridcolor=GRID,
         tickformat=".2f",
         fixedrange=False,
         showspikes=True,
-        spikecolor="#dddddd",
+        spikecolor=TEXT_MUTED,
         spikemode="across",
     )
 
@@ -3719,9 +3728,10 @@ def create_interactive_chart(
     responsive_styles = """
 <style>
     :root {
+__THEME_CSS_VARIABLES__
         color-scheme: dark;
-        font-family: Arial, sans-serif;
-        background: #101215;
+        font-family: var(--font-sans);
+        background: var(--background);
     }
 
     * {
@@ -3736,7 +3746,25 @@ def create_interactive_chart(
         overflow-x: hidden;
         overflow-y: auto;
         scroll-behavior: smooth;
-        background: #101215;
+        color: var(--text);
+        background:
+            linear-gradient(
+                rgba(255, 253, 248, 0.025) 1px,
+                transparent 1px
+            ),
+            linear-gradient(
+                90deg,
+                rgba(255, 253, 248, 0.025) 1px,
+                transparent 1px
+            ),
+            radial-gradient(
+                circle at 88% 10%,
+                rgba(219, 160, 121, 0.09),
+                transparent 30%
+            ),
+            var(--background);
+        background-attachment: fixed;
+        background-size: 64px 64px, 64px 64px, auto, auto;
     }
 
     #chart-shell {
@@ -3746,7 +3774,7 @@ def create_interactive_chart(
         height: 100dvh;
         min-height: 520px;
         overflow: hidden;
-        background: #101215;
+        background: var(--background);
     }
 
     #smc-chart {
@@ -3764,7 +3792,7 @@ def create_interactive_chart(
         justify-content: center;
         flex-direction: column;
         gap: 10px;
-        color: #dce6ee;
+        color: var(--text);
         text-align: center;
         pointer-events: none;
     }
@@ -3792,14 +3820,14 @@ def create_interactive_chart(
     body.trade-history-mode #chart-shell {
         height: min(780px, 78vh);
         min-height: 540px;
-        border-bottom: 1px solid #27313a;
+        border-bottom: 1px solid var(--border);
     }
 
     .chart-loading-spinner {
         width: 30px;
         height: 30px;
-        border: 3px solid #34404a;
-        border-top-color: #35d4b2;
+        border: 3px solid rgba(255, 253, 248, 0.16);
+        border-top-color: var(--accent);
         border-radius: 50%;
         animation: chart-loading-spin .8s linear infinite;
     }
@@ -3809,7 +3837,7 @@ def create_interactive_chart(
     }
 
     .chart-loading small {
-        color: #8f9ca8;
+        color: var(--muted);
         font-size: 11px;
     }
 
@@ -3827,11 +3855,49 @@ def create_interactive_chart(
         gap: 6px;
         max-width: min(760px, calc(100vw - 120px));
         padding: 5px;
-        border: 1px solid #39424d;
-        border-radius: 9px;
-        background: rgba(16, 18, 21, 0.88);
-        box-shadow: 0 4px 18px rgba(0, 0, 0, 0.28);
-        backdrop-filter: blur(8px);
+        border: 1px solid var(--border);
+        border-radius: 13px;
+        background: rgba(23, 32, 27, 0.92);
+        box-shadow: 0 16px 40px rgba(0, 0, 0, 0.24);
+        backdrop-filter: blur(14px);
+    }
+
+    .chart-heading {
+        position: absolute;
+        z-index: 19;
+        top: max(12px, env(safe-area-inset-top));
+        right: max(16px, env(safe-area-inset-right));
+        max-width: min(620px, calc(100vw - 260px));
+        text-align: right;
+        pointer-events: none;
+    }
+
+    .chart-heading span {
+        display: block;
+        margin-bottom: 2px;
+        color: var(--accent);
+        font-size: 9px;
+        font-weight: 800;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+    }
+
+    .chart-heading strong {
+        display: block;
+        color: var(--text-strong);
+        font-family: var(--font-display);
+        font-size: clamp(20px, 2.4vw, 30px);
+        font-weight: 400;
+        letter-spacing: -0.025em;
+        line-height: 1;
+    }
+
+    .chart-heading small {
+        display: block;
+        margin-top: 4px;
+        color: var(--muted);
+        font-size: 10px;
+        line-height: 1.35;
     }
 
     .toolbar-group {
@@ -3842,16 +3908,16 @@ def create_interactive_chart(
 
     .toolbar-group + .toolbar-group {
         padding-left: 6px;
-        border-left: 1px solid #3b4652;
+        border-left: 1px solid var(--border);
     }
 
     .chart-actions button {
         min-height: 34px;
         padding: 6px 11px;
-        border: 1px solid #505b68;
-        border-radius: 6px;
-        color: #eef3f8;
-        background: #20262d;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        color: var(--text-strong);
+        background: rgba(255, 255, 255, 0.035);
         font: inherit;
         font-size: 12px;
         font-weight: 600;
@@ -3861,8 +3927,9 @@ def create_interactive_chart(
 
     .chart-actions button:hover,
     .chart-actions button:focus-visible {
-        border-color: #19c9a5;
-        background: #29323a;
+        border-color: var(--accent);
+        color: var(--text-strong);
+        background: rgba(197, 106, 61, 0.14);
         outline: none;
     }
 
@@ -3872,9 +3939,9 @@ def create_interactive_chart(
 
     .chart-actions button[aria-expanded="true"],
     .chart-actions .primary-action {
-        border-color: #19c9a5;
-        color: #dffff7;
-        background: #183a35;
+        border-color: var(--accent);
+        color: var(--text-strong);
+        background: rgba(197, 106, 61, 0.18);
     }
 
     .indicator-panel {
@@ -3886,10 +3953,10 @@ def create_interactive_chart(
         max-height: calc(100dvh - 118px);
         overflow: auto;
         padding: 12px;
-        border: 1px solid #3d4955;
-        border-radius: 11px;
-        color: #edf3f8;
-        background: rgba(17, 20, 24, 0.96);
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        color: var(--text);
+        background: rgba(23, 32, 27, 0.97);
         box-shadow: 0 12px 36px rgba(0, 0, 0, 0.42);
         backdrop-filter: blur(12px);
     }
@@ -3908,18 +3975,21 @@ def create_interactive_chart(
 
     .panel-header h2 {
         margin: 0;
-        font-size: 14px;
-        letter-spacing: 0.02em;
+        color: var(--text-strong);
+        font-family: var(--font-display);
+        font-size: 18px;
+        font-weight: 400;
+        letter-spacing: -0.01em;
     }
 
     .icon-button {
         width: 30px;
         height: 30px;
         padding: 0;
-        border: 1px solid #4a5663;
-        border-radius: 6px;
-        color: #dbe4ec;
-        background: #252b32;
+        border: 1px solid var(--border);
+        border-radius: 50%;
+        color: var(--text);
+        background: rgba(255, 255, 255, 0.04);
         cursor: pointer;
     }
 
@@ -3932,30 +4002,30 @@ def create_interactive_chart(
 
     .panel-hint {
         margin: -4px 2px 12px;
-        color: #8fa0af;
+        color: var(--muted);
         font-size: 10px;
         line-height: 1.45;
     }
 
     .panel-actions button {
         min-height: 32px;
-        border: 1px solid #485461;
-        border-radius: 6px;
-        color: #e9f0f6;
-        background: #232a31;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        color: var(--text);
+        background: rgba(255, 255, 255, 0.04);
         cursor: pointer;
     }
 
     .indicator-panel fieldset {
         margin: 0 0 12px;
         padding: 8px;
-        border: 1px solid #303a44;
-        border-radius: 8px;
+        border: 1px solid var(--border);
+        border-radius: 13px;
     }
 
     .indicator-panel legend {
         padding: 0 6px;
-        color: #98a8b7;
+        color: var(--accent);
         font-size: 10px;
         font-weight: 700;
         letter-spacing: 0.09em;
@@ -3970,7 +4040,7 @@ def create_interactive_chart(
         gap: 8px;
         min-height: 34px;
         padding: 4px 3px;
-        color: #dce5ed;
+        color: var(--text);
         font-size: 12px;
         cursor: pointer;
     }
@@ -3981,7 +4051,7 @@ def create_interactive_chart(
 
     .layer-option + .layer-option,
     .display-option + .display-option {
-        border-top: 1px solid rgba(67, 79, 91, 0.45);
+        border-top: 1px solid var(--border);
     }
 
     .layer-option input,
@@ -3989,7 +4059,7 @@ def create_interactive_chart(
         width: 16px;
         height: 16px;
         margin: 0;
-        accent-color: #19c9a5;
+        accent-color: var(--accent-dark);
     }
 
     .layer-swatch {
@@ -4003,15 +4073,15 @@ def create_interactive_chart(
     .chart-help {
         width: min(540px, calc(100vw - 24px));
         padding: 0;
-        border: 1px solid #465360;
-        border-radius: 12px;
-        color: #eaf1f7;
-        background: #15191e;
+        border: 1px solid var(--border);
+        border-radius: 20px;
+        color: var(--text);
+        background: var(--surface);
         box-shadow: 0 18px 60px rgba(0, 0, 0, 0.58);
     }
 
     .chart-help::backdrop {
-        background: rgba(4, 6, 8, 0.72);
+        background: rgba(6, 10, 8, 0.78);
         backdrop-filter: blur(3px);
     }
 
@@ -4021,19 +4091,22 @@ def create_interactive_chart(
 
     .help-content h2 {
         margin: 0 0 12px;
-        font-size: 18px;
+        color: var(--text-strong);
+        font-family: var(--font-display);
+        font-size: 28px;
+        font-weight: 400;
     }
 
     .help-content h3 {
         margin: 16px 0 6px;
-        color: #8fe8d4;
+        color: var(--accent);
         font-size: 12px;
         text-transform: uppercase;
     }
 
     .help-content p,
     .help-content li {
-        color: #bdc9d4;
+        color: var(--muted);
         font-size: 12px;
         line-height: 1.55;
     }
@@ -4052,10 +4125,10 @@ def create_interactive_chart(
     .help-footer button {
         min-height: 34px;
         padding: 6px 14px;
-        border: 1px solid #19c9a5;
-        border-radius: 6px;
-        color: #dffff7;
-        background: #183a35;
+        border: 1px solid var(--accent);
+        border-radius: 10px;
+        color: var(--text-strong);
+        background: rgba(197, 106, 61, 0.18);
         cursor: pointer;
     }
 
@@ -4066,10 +4139,10 @@ def create_interactive_chart(
         bottom: 64px;
         max-width: min(440px, calc(100vw - 24px));
         padding: 7px 10px;
-        border: 1px solid #495563;
-        border-radius: 7px;
-        color: #e8eef5;
-        background: rgba(16, 18, 21, 0.86);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        color: var(--text);
+        background: rgba(23, 32, 27, 0.9);
         box-shadow: 0 3px 14px rgba(0, 0, 0, 0.24);
         font-size: 12px;
         pointer-events: none;
@@ -4086,10 +4159,10 @@ def create_interactive_chart(
         gap: 7px;
         min-height: 28px;
         padding: 5px 9px;
-        border: 1px solid #3d4955;
+        border: 1px solid var(--border);
         border-radius: 999px;
-        color: #a9b7c4;
-        background: rgba(16, 18, 21, 0.9);
+        color: var(--muted);
+        background: rgba(23, 32, 27, 0.92);
         font-size: 10px;
         font-weight: 700;
         letter-spacing: 0.06em;
@@ -4100,45 +4173,59 @@ def create_interactive_chart(
         width: 8px;
         height: 8px;
         border-radius: 50%;
-        background: #7f8b97;
+        background: var(--muted);
         content: "";
     }
 
     .live-badge[data-state="live"] {
-        border-color: rgba(25, 201, 165, 0.55);
-        color: #9ff3df;
+        border-color: rgba(111, 201, 173, 0.55);
+        color: var(--positive-strong);
     }
 
     .live-badge[data-state="live"]::before {
-        background: #19c9a5;
-        box-shadow: 0 0 9px rgba(25, 201, 165, 0.9);
+        background: var(--positive);
+        box-shadow: 0 0 9px rgba(111, 201, 173, 0.75);
     }
 
     .live-badge[data-state="error"] {
-        border-color: rgba(255, 77, 91, 0.65);
-        color: #ff9aa4;
+        border-color: rgba(223, 119, 119, 0.65);
+        color: var(--negative-strong);
     }
 
     .live-badge[data-state="error"]::before {
-        background: #ff4d5b;
+        background: var(--negative);
     }
 
     .analysis-dashboard {
         width: min(1440px, 100%);
         margin: 0 auto;
         padding: 44px clamp(16px, 4vw, 56px) 64px;
-        color: #e8eef4;
+        border-top: 1px solid var(--border);
+        color: var(--text);
         background:
-            radial-gradient(circle at 12% 0%, rgba(25, 201, 165, 0.08), transparent 28%),
-            #0d1013;
+            linear-gradient(
+                rgba(255, 253, 248, 0.025) 1px,
+                transparent 1px
+            ),
+            linear-gradient(
+                90deg,
+                rgba(255, 253, 248, 0.025) 1px,
+                transparent 1px
+            ),
+            radial-gradient(
+                circle at 90% 0%,
+                rgba(219, 160, 121, 0.08),
+                transparent 30%
+            );
+        background-size: 64px 64px, 64px 64px, auto;
     }
 
     .backtest-dashboard {
         width: min(1440px, 100%);
         margin: 0 auto;
         padding: 0 clamp(16px, 4vw, 56px) 64px;
-        color: #e8eef4;
-        background: #0d1013;
+        color: var(--text);
+        background: var(--background);
     }
 
     .backtest-links {
@@ -4154,9 +4241,9 @@ def create_interactive_chart(
     .trade-table-wrap {
         width: 100%;
         overflow-x: auto;
-        border: 1px solid #27313a;
-        border-radius: 10px;
-        background: #11161a;
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.025);
     }
 
     .trade-table {
@@ -4168,7 +4255,8 @@ def create_interactive_chart(
 
     .trade-table caption {
         padding: 14px 16px;
-        color: #dce6ee;
+        color: var(--text-strong);
+        font-family: var(--font-display);
         font-size: 13px;
         font-weight: 700;
         text-align: left;
@@ -4177,23 +4265,23 @@ def create_interactive_chart(
     .trade-table th,
     .trade-table td {
         padding: 10px 12px;
-        border-top: 1px solid #26313a;
-        color: #aab7c2;
+        border-top: 1px solid var(--border);
+        color: var(--muted);
         text-align: left;
         white-space: nowrap;
     }
 
     .trade-table th {
-        color: #dce6ee;
-        background: #171d22;
+        color: var(--text-strong);
+        background: rgba(255, 255, 255, 0.04);
     }
 
     .trade-table .trade-win {
-        color: #65e9cb;
+        color: var(--positive-strong);
     }
 
     .trade-table .trade-loss {
-        color: #ff8c97;
+        color: var(--negative-strong);
     }
 
     .dashboard-header,
@@ -4208,20 +4296,25 @@ def create_interactive_chart(
     .dashboard-header h2,
     .reference-header h2 {
         margin: 2px 0 5px;
-        font-size: clamp(22px, 3vw, 34px);
+        color: var(--text-strong);
+        font-family: var(--font-display);
+        font-size: clamp(34px, 5vw, 66px);
+        font-weight: 400;
+        letter-spacing: -0.035em;
+        line-height: 0.98;
     }
 
     .dashboard-header p,
     .reference-header p {
         max-width: 760px;
         margin: 0;
-        color: #91a0ae;
+        color: var(--muted);
         font-size: 12px;
         line-height: 1.55;
     }
 
     .eyebrow {
-        color: #19c9a5 !important;
+        color: var(--accent) !important;
         font-size: 10px !important;
         font-weight: 800;
         letter-spacing: 0.15em;
@@ -4231,11 +4324,25 @@ def create_interactive_chart(
     .back-to-chart {
         flex: 0 0 auto;
         padding: 8px 12px;
-        border: 1px solid #40505d;
-        border-radius: 7px;
-        color: #dbe6ef;
+        border: 1px solid var(--border-strong);
+        border-radius: 999px;
+        color: var(--text-strong);
         text-decoration: none;
-        background: #171c21;
+        background: rgba(255, 255, 255, 0.035);
+        cursor: pointer;
+        font: inherit;
+        transition:
+            border-color 160ms ease,
+            background-color 160ms ease,
+            color 160ms ease;
+    }
+
+    .back-to-chart:hover,
+    .back-to-chart:focus-visible {
+        border-color: var(--accent);
+        color: var(--text-strong);
+        background: rgba(197, 106, 61, 0.14);
+        outline: none;
     }
 
     .metric-grid {
@@ -4248,16 +4355,16 @@ def create_interactive_chart(
     .metric-card {
         min-width: 0;
         padding: 16px;
-        border: 1px solid #27313a;
-        border-radius: 10px;
-        background: linear-gradient(145deg, #151a1f, #11151a);
-        box-shadow: 0 8px 22px rgba(0, 0, 0, 0.18);
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.035);
+        box-shadow: none;
     }
 
     .metric-card > span {
         display: block;
         margin-bottom: 8px;
-        color: #8393a1;
+        color: var(--muted);
         font-size: 10px;
         font-weight: 700;
         letter-spacing: 0.08em;
@@ -4267,26 +4374,29 @@ def create_interactive_chart(
     .metric-card strong {
         display: block;
         overflow-wrap: anywhere;
-        color: #f0f5f9;
-        font-size: 16px;
+        color: var(--text-strong);
+        font-family: var(--font-display);
+        font-size: 20px;
+        font-weight: 400;
         line-height: 1.35;
     }
 
     .metric-card small {
         display: block;
         margin-top: 7px;
-        color: #9aa8b5;
+        color: var(--muted);
         font-size: 11px;
         line-height: 1.45;
     }
 
     .metric-primary {
-        border-color: rgba(25, 201, 165, 0.45);
+        border-color: rgba(219, 160, 121, 0.52);
+        background: rgba(197, 106, 61, 0.11);
     }
 
     .metric-primary strong {
-        color: #65e9cb;
-        font-size: 24px;
+        color: var(--accent-strong);
+        font-size: 30px;
     }
 
     .metric-wide {
@@ -4304,18 +4414,20 @@ def create_interactive_chart(
     }
 
     .definition-card {
-        --accent: #8393a1;
+        --accent: var(--muted);
         padding: 18px;
-        border: 1px solid #26313a;
-        border-top: 3px solid var(--accent);
-        border-radius: 9px;
-        background: #12171b;
+        border: 1px solid var(--border);
+        border-left: 2px solid var(--accent);
+        border-radius: 13px;
+        background: rgba(255, 255, 255, 0.025);
     }
 
     .definition-card h3 {
         margin: 0 0 12px;
-        color: #f0f4f7;
-        font-size: 15px;
+        color: var(--text-strong);
+        font-family: var(--font-display);
+        font-size: 21px;
+        font-weight: 400;
     }
 
     .definition-card h3 span {
@@ -4326,13 +4438,13 @@ def create_interactive_chart(
 
     .definition-card p {
         margin: 7px 0 0;
-        color: #a5b2bd;
+        color: var(--muted);
         font-size: 12px;
         line-height: 1.58;
     }
 
     .definition-card strong {
-        color: #dce5ec;
+        color: var(--text);
     }
 
     .fvg-definition { --accent: #00dc79; }
@@ -4349,9 +4461,9 @@ def create_interactive_chart(
     .analysis-disclaimer {
         margin: 24px 0 0;
         padding: 12px 14px;
-        border-left: 3px solid #ffb300;
-        color: #9daab5;
-        background: rgba(255, 179, 0, 0.06);
+        border-left: 2px solid var(--accent);
+        color: var(--muted);
+        background: rgba(219, 160, 121, 0.07);
         font-size: 11px;
         line-height: 1.5;
     }
@@ -4418,6 +4530,15 @@ def create_interactive_chart(
             transform: scale(0.9);
             transform-origin: top right;
         }
+
+        .chart-heading {
+            right: 10px;
+            max-width: calc(100vw - 170px);
+        }
+
+        .chart-heading small {
+            display: none;
+        }
     }
 
     @media (prefers-reduced-motion: reduce) {
@@ -4430,11 +4551,19 @@ def create_interactive_chart(
         }
     }
 </style>
-"""
+""".replace(
+        "__THEME_CSS_VARIABLES__",
+        CSS_VARIABLES,
+    )
 
     chart_controls = """
 <main id="chart-shell">
     <div id="live-badge" class="live-badge" data-state="static">Loading chart</div>
+    <header class="chart-heading">
+        <span>Market research</span>
+        <strong>__CHART_HEADING__</strong>
+        <small>__CHART_SUBTITLE__</small>
+    </header>
     <nav class="chart-actions" aria-label="Chart controls">
         <span class="toolbar-group">
             <button id="chart-indicators" class="primary-action" type="button" title="Organize indicators (I)" aria-expanded="false" aria-controls="indicator-panel">
@@ -4593,6 +4722,19 @@ def create_interactive_chart(
         .replace(
             "__MPLFINANCE_OUTPUT_FILE__",
             MPLFINANCE_OUTPUT_FILE,
+        )
+        .replace(
+            "__CHART_HEADING__",
+            f"{SYMBOL} {TIMEFRAME_NAME}",
+        )
+        .replace(
+            "__CHART_SUBTITLE__",
+            (
+                "Executed trade audit · entries, exits, SL, and TP"
+                if trade_history_mode
+                else
+                "Smart Money Concepts · completed-candle analysis"
+            ),
         )
         .replace("XAUUSD", SYMBOL)
     )
@@ -4812,18 +4954,61 @@ def build_mplfinance_viewer() -> str:
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>XAUUSD SMC clean chart</title>
     <style>
-        :root { color-scheme: dark; font-family: Arial, sans-serif; background: #0d1013; }
+        :root {
+__THEME_CSS_VARIABLES__
+            color-scheme: dark;
+            font-family: var(--font-sans);
+            background: var(--background);
+        }
         * { box-sizing: border-box; }
-        body { margin: 0; color: #e8eef4; background: #0d1013; }
-        header { position: sticky; z-index: 2; top: 0; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 16px; border-bottom: 1px solid #29333d; background: rgba(13,16,19,.94); backdrop-filter: blur(8px); }
-        h1 { margin: 0; font-size: 16px; }
-        p { margin: 3px 0 0; color: #94a2af; font-size: 11px; }
+        body {
+            margin: 0;
+            color: var(--text);
+            background:
+                radial-gradient(circle at 90% 0%, rgba(219,160,121,.09), transparent 28%),
+                var(--background);
+        }
+        header {
+            position: sticky;
+            z-index: 2;
+            top: 0;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            padding: 14px 20px;
+            border-bottom: 1px solid var(--border);
+            background: rgba(17,23,19,.94);
+            backdrop-filter: blur(12px);
+        }
+        h1 {
+            margin: 0;
+            color: var(--text-strong);
+            font-family: var(--font-display);
+            font-size: 22px;
+            font-weight: 400;
+        }
+        p { margin: 3px 0 0; color: var(--muted); font-size: 11px; }
         nav { display: flex; flex-wrap: wrap; gap: 7px; }
-        a { padding: 7px 10px; border: 1px solid #465460; border-radius: 6px; color: #e8eef4; background: #1c2329; text-decoration: none; font-size: 12px; }
+        a {
+            padding: 8px 12px;
+            border: 1px solid var(--border-strong);
+            border-radius: 999px;
+            color: var(--text-strong);
+            background: rgba(255,255,255,.035);
+            text-decoration: none;
+            font-size: 12px;
+        }
+        a:hover,
+        a:focus-visible {
+            border-color: var(--accent);
+            background: rgba(197,106,61,.14);
+            outline: none;
+        }
         main { padding: 12px; }
-        img { display: block; width: 100%; height: auto; border: 1px solid #28323b; background: #101215; }
-        #status[data-state="live"] { color: #65e9cb; }
-        #status[data-state="error"] { color: #ff8c97; }
+        img { display: block; width: 100%; height: auto; border: 1px solid var(--border); background: var(--background); }
+        #status[data-state="live"] { color: var(--positive-strong); }
+        #status[data-state="error"] { color: var(--negative-strong); }
         @media (max-width: 640px) { header { align-items: flex-start; flex-direction: column; } main { padding: 6px; } }
     </style>
 </head>
@@ -4875,6 +5060,10 @@ def build_mplfinance_viewer() -> str:
 
     return (
         viewer
+        .replace(
+            "__THEME_CSS_VARIABLES__",
+            CSS_VARIABLES,
+        )
         .replace(
             "__LIVE_REFRESH_MS__",
             str(LIVE_REFRESH_SECONDS * 1000),

@@ -28,8 +28,8 @@ LIQUIDITY_RANGE = 0.01
 
 SESSION_TIME_ZONE = "UTC"
 SESSION_COLORS = {
-    "London": "rgba(45, 145, 255, 0.07)",
-    "New York": "rgba(255, 155, 45, 0.07)",
+    "London": "rgba(111, 201, 173, 0.07)",
+    "New York": "rgba(219, 160, 121, 0.08)",
 }
 
 # Expanded zone limits for comprehensive coverage

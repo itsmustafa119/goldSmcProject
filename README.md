@@ -4,15 +4,19 @@
 
 # MT5 Smart Money Concepts
 
-[![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![CI](https://github.com/itsmustafa119/goldSmcProject/actions/workflows/ci.yml/badge.svg)](https://github.com/itsmustafa119/goldSmcProject/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![MetaTrader 5](https://img.shields.io/badge/Data-MetaTrader%205-0696D7)](https://www.metatrader5.com/)
 [![Plotly](https://img.shields.io/badge/Charts-Plotly-3F4F75?logo=plotly&logoColor=white)](https://plotly.com/python/)
-[![Tests](https://img.shields.io/badge/tests-11%20passing-2EA44F)](tests/)
+[![Local first](https://img.shields.io/badge/service-localhost%20only-D69A73)](#privacy-and-scope)
 
 An interactive market-analysis and strategy-backtesting toolkit built around
 MetaTrader 5, completed candles, and auditable Smart Money Concepts signals.
 
-![XAUUSD M15 Smart Money Concepts analysis dashboard](docs/images/analysis-dashboard.png)
+[View the portfolio case study](https://mustafasadiqi.vercel.app/projects/xauusd-smc-dashboard)
+· [Usage and troubleshooting](docs/USAGE.md)
+
+![XAUUSD M15 Smart Money Concepts analysis chart](docs/images/analysis-chart.png)
 
 ## Two focused workflows
 
@@ -31,7 +35,7 @@ Requirements:
 
 - Windows;
 - MetaTrader 5 installed, open, logged in, and connected;
-- Python 3.11 or newer;
+- Python 3.13;
 - a virtual environment named `.venv`.
 
 Install the dependencies:
@@ -57,11 +61,9 @@ completed candle is available. It can display:
 - London and New York sessions;
 - retracement, confluence, and live-session panels.
 
-### Detailed chart example
+### Reading the chart example
 
-![Detailed XAUUSD M15 chart with FVG, order-block, liquidity, and market-structure overlays](docs/images/analysis-chart.png)
-
-In this example, green and red zones represent bullish and bearish FVGs,
+In the screenshot above, green and red zones represent bullish and bearish FVGs,
 hatched blue and orange zones represent order blocks, dashed horizontal levels
 represent liquidity or reference levels, and labeled swing points explain the
 detected structure.
@@ -90,6 +92,19 @@ The report includes:
 
 Backtests use completed candles and modeled execution costs. Historical results
 are simulations, not guarantees of future performance.
+
+## Privacy and scope
+
+- Both web interfaces bind to `127.0.0.1`; they are not published as internet
+  services.
+- MT5 account credentials are neither requested nor stored by this repository.
+- Generated candles, reports, CSV files, Plotly assets, logs, caches, and lock
+  files stay under ignored local paths.
+- Strategy files contain research rules only. Nothing in this project places a
+  live order.
+
+Before publishing a fork, review its Git history and never commit broker
+credentials, account exports, or generated market-data files.
 
 ## Command-line use
 
@@ -120,6 +135,16 @@ run_backtest.bat   Strategy-backtest launcher
 
 Runtime files are written to `outputs/` and excluded from Git. The local Plotly
 runtime is generated automatically when it is missing.
+
+## Development
+
+Run the regression suite with:
+
+```powershell
+.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+The GitHub Actions workflow runs the same suite on Windows and Python 3.13.
 
 ## Topics
 
