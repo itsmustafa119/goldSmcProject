@@ -1,3 +1,7 @@
+![GitHub stars](https://img.shields.io/github/stars/itsmustafa119/goldSmcProject)
+![GitHub license](https://img.shields.io/github/license/itsmustafa119/goldSmcProject)
+![Python](https://img.shields.io/badge/python-3.x-blue)
+
 # MT5 Smart Money Concepts
 
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
